@@ -100,7 +100,7 @@ fn main() -> ! {
     );
 
     // Configure GPIO25 as an output
-    let mut led_pin = pins.gpio25.into_push_pull_output();
+    let mut led_pin = pins.gpio28.into_push_pull_output();
     loop {
         info!("on!");
         led_pin.set_high().unwrap();
