@@ -1,196 +1,200 @@
-//! SPDX-License-Identifier: MIT OR Apache-2.0
-//!
-//! Copyright (c) 2021–2024 The rp-rs Developers
-//! Copyright (c) 2021 rp-rs organization
-//! Copyright (c) 2025 Raspberry Pi Ltd.
-//!
-//! # GPIO 'Blinky' Example
-//!
-//! This application demonstrates how to control a GPIO pin on the rp2040 and rp235x.
-//!
-//! It may need to be adapted to your particular board layout and/or pin assignment.
+//! pico2w-shell-rs using Embassy
+//! Background blinking for CYW43 LED and Async UART CLI
 
 #![no_std]
 #![no_main]
 
+use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use defmt_rtt as _;
-use embedded_hal::digital::OutputPin;
+use embassy_executor::Spawner;
+use embassy_rp::bind_interrupts;
+use embassy_rp::gpio::{Level, Output};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH2, PIO0, UART0};
+use embassy_rp::pio::{InterruptHandler, Pio};
+use embassy_rp::uart::{Config, InterruptHandler as UartInterruptHandler, Uart};
+use embassy_time::{Duration, Timer};
+use static_cell::StaticCell;
+
 #[cfg(target_arch = "riscv32")]
 use panic_halt as _;
 #[cfg(target_arch = "arm")]
 use panic_probe as _;
 
-use core::fmt::Write;
-use embedded_hal_nb::serial::{Read, Write as _};
-use fugit::RateExtU32;
-use hal::prelude::*;
-use hal::uart::{DataBits, StopBits, UartConfig};
+bind_interrupts!(struct Irqs {
+    PIO0_IRQ_0 => InterruptHandler<PIO0>;
+    UART0_IRQ => UartInterruptHandler<UART0>;
+    DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>,
+                 embassy_rp::dma::InterruptHandler<DMA_CH1>,
+                 embassy_rp::dma::InterruptHandler<DMA_CH2>;
+});
 
-// Alias for our HAL crate
-use hal::entry;
+/// Background task to blink the CYW43 LED
+#[embassy_executor::task]
+async fn blink_task(mut control: cyw43::Control<'static>) {
+    loop {
+        control.gpio_set(0, true).await;
+        Timer::after(Duration::from_millis(500)).await;
+        control.gpio_set(0, false).await;
+        Timer::after(Duration::from_millis(500)).await;
+    }
+}
 
-#[cfg(rp2350)]
-use rp235x_hal as hal;
+/// Helper to write all bytes to UART
+async fn uart_write_all(uart: &mut Uart<'static, embassy_rp::uart::Async>, buf: &[u8]) {
+    let _ = uart.write(buf).await;
+}
 
-#[cfg(rp2040)]
-use rp2040_hal as hal;
+/// Task to handle UART CLI
+#[embassy_executor::task]
+async fn uart_task(mut uart: Uart<'static, embassy_rp::uart::Async>, mut led: Output<'static>) {
+    let mut buf = [0u8; 64];
+    let mut idx = 0;
 
-// use bsp::entry;
-// use bsp::hal;
-// use rp_pico as bsp;
-
-/// The linker will place this boot block at the start of our program image. We
-/// need this to help the ROM bootloader get our code up and running.
-/// Note: This boot block is not necessary when using a rp-hal based BSP
-/// as the BSPs already perform this step.
-#[unsafe(link_section = ".boot2")]
-#[used]
-#[cfg(rp2040)]
-pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
-
-/// Tell the Boot ROM about our application
-#[unsafe(link_section = ".start_block")]
-#[used]
-#[cfg(rp2350)]
-pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
-
-/// External high-speed crystal on the Raspberry Pi Pico 2 board is 12 MHz.
-/// Adjust if your board has a different frequency
-const XTAL_FREQ_HZ: u32 = 12_000_000u32;
-
-/// Entry point to our bare-metal application.
-///
-/// The `#[hal::entry]` macro ensures the Cortex-M start-up code calls this function
-/// as soon as all global variables and the spinlock are initialised.
-///
-/// The function configures the rp2040 and rp235x peripherals, then toggles a GPIO pin in
-/// an infinite loop. If there is an LED connected to that pin, it will blink.
-#[entry]
-fn main() -> ! {
-    info!("Program start");
-    // Grab our singleton objects
-    let mut pac = hal::pac::Peripherals::take().unwrap();
-
-    // Set up the watchdog driver - needed by the clock setup code
-    let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
-
-    // Configure the clocks
-    let clocks = hal::clocks::init_clocks_and_plls(
-        XTAL_FREQ_HZ,
-        pac.XOSC,
-        pac.CLOCKS,
-        pac.PLL_SYS,
-        pac.PLL_USB,
-        &mut pac.RESETS,
-        &mut watchdog,
+    uart_write_all(
+        &mut uart,
+        b"\r\nPico 2W Shell (Embassy)\r\nType 'help' for commands.\r\n> ",
     )
-    .unwrap();
-
-    // The single-cycle I/O block controls our GPIO pins
-    let sio = hal::Sio::new(pac.SIO);
-
-    // Set the pins to their default state
-    let pins = hal::gpio::Pins::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut pac.RESETS,
-    );
-
-    // Configure UART pins
-    let uart_pins = (
-        pins.gpio0.into_function::<hal::gpio::FunctionUart>(),
-        pins.gpio1.into_function::<hal::gpio::FunctionUart>(),
-    );
-
-    // Initialize UART
-    let uart = hal::uart::UartPeripheral::new(pac.UART0, uart_pins, &mut pac.RESETS)
-        .enable(
-            UartConfig::new(115_200.Hz(), DataBits::Eight, None, StopBits::One),
-            clocks.peripheral_clock.freq(),
-        )
-        .unwrap();
-
-    let mut led_pin = pins.gpio28.into_push_pull_output();
-
-    // UART Writer for responses
-    let mut uart = uart;
-
-    writeln!(
-        uart,
-        "\r\nPico 2W Shell (Rust)\r\nType 'help' for commands.\r\n"
-    )
-    .unwrap();
-
-    let mut input_buf = [0u8; 64];
-    let mut input_idx = 0;
+    .await;
 
     loop {
-        // Read from UART (blocking for simplicity)
-        if let Ok(c) = nb::block!(uart.read()) {
-            // Echo back
-            let _ = nb::block!(uart.write(c));
+        let mut byte = [0u8; 1];
+        if let Ok(_) = uart.read(&mut byte).await {
+            let c = byte[0];
+
+            // Echo
+            uart_write_all(&mut uart, &[c]).await;
 
             if c == b'\r' || c == b'\n' {
-                let _ = uart.write_str("\r\n");
-                if input_idx > 0 {
-                    let cmd = core::str::from_utf8(&input_buf[..input_idx]).unwrap_or("");
+                uart_write_all(&mut uart, b"\r\n").await;
+                if idx > 0 {
+                    let cmd = core::str::from_utf8(&buf[..idx]).unwrap_or("");
                     match cmd {
                         "help" => {
-                            let _ = uart.write_str("Available commands:\r\n");
-                            let _ = uart.write_str("  help    - Show this help\r\n");
-                            let _ = uart.write_str("  led on  - Turn LED on\r\n");
-                            let _ = uart.write_str("  led off - Turn LED off\r\n");
-                            let _ = uart.write_str("  info    - Show system info\r\n");
+                            uart_write_all(&mut uart, b"Available commands:\r\n").await;
+                            uart_write_all(&mut uart, b"  help    - Show this help\r\n").await;
+                            uart_write_all(&mut uart, b"  led on  - Turn LED on\r\n").await;
+                            uart_write_all(&mut uart, b"  led off - Turn LED off\r\n").await;
+                            uart_write_all(&mut uart, b"  info    - Show system info\r\n").await;
                         }
                         "led on" => {
-                            led_pin.set_high().unwrap();
-                            let _ = uart.write_str("LED is ON\r\n");
+                            // control.gpio_set(0, true).await;
+                            led.set_high();
+                            uart_write_all(&mut uart, b"LED is ON\r\n").await;
                         }
                         "led off" => {
-                            led_pin.set_low().unwrap();
-                            let _ = uart.write_str("LED is OFF\r\n");
+                            //control.gpio_set(0, false).await;
+                            led.set_low();
+                            uart_write_all(&mut uart, b"LED is OFF\r\n").await;
                         }
                         "info" => {
-                            let _ = uart.write_str("System: Raspberry Pi Pico series\r\n");
-                            #[cfg(rp2040)]
-                            let _ = uart.write_str("Chip: RP2040\r\n");
-                            #[cfg(rp2350)]
-                            let _ = uart.write_str("Chip: RP2350\r\n");
+                            uart_write_all(
+                                &mut uart,
+                                b"System: Raspberry Pi Pico 2 W (Embassy)\r\n",
+                            )
+                            .await;
+                            uart_write_all(&mut uart, b"Chip: RP2350\r\n").await;
                         }
                         _ => {
-                            let _ = uart.write_str("Unknown command: ");
-                            let _ = uart.write_str(cmd);
-                            let _ = uart.write_str("\r\n");
+                            uart_write_all(&mut uart, b"Unknown command: ").await;
+                            uart_write_all(&mut uart, cmd.as_bytes()).await;
+                            uart_write_all(&mut uart, b"\r\n").await;
                         }
                     }
-                    input_idx = 0;
+                    idx = 0;
                 }
-                let _ = uart.write_str("> ");
+                uart_write_all(&mut uart, b"> ").await;
             } else if c == 0x08 || c == 0x7F {
-                // Backspace
-                if input_idx > 0 {
-                    input_idx -= 1;
-                    let _ = uart.write_str("\x08 \x08");
+                if idx > 0 {
+                    idx -= 1;
+                    uart_write_all(&mut uart, b"\x08 \x08").await;
                 }
-            } else if input_idx < input_buf.len() {
-                input_buf[input_idx] = c;
-                input_idx += 1;
+            } else if idx < buf.len() {
+                buf[idx] = c;
+                idx += 1;
             }
         }
+    }
+}
+
+type MyCywBus = cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>;
+
+#[embassy_executor::task]
+async fn cyw43_task(runner: cyw43::Runner<'static, MyCywBus>) -> ! {
+    runner.run().await
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_rp::init(Default::default());
+    info!("Pico 2 W Embassy Start");
+
+    // Include firmware
+    // Note: Missing files in cyw43-firmware/ will cause build error.
+    let fw = cyw43::aligned_bytes!("../cyw43-firmware/43439A0.bin");
+    let clm = cyw43::aligned_bytes!("../cyw43-firmware/43439A0_clm.bin");
+    let nvram = cyw43::aligned_bytes!("../cyw43-firmware/nvram_rp2040.bin");
+
+    let pwr = Output::new(p.PIN_23, Level::Low);
+    let cs = Output::new(p.PIN_25, Level::High);
+    let mut pio = Pio::new(p.PIO0, Irqs);
+
+    let spi = PioSpi::new(
+        &mut pio.common,
+        pio.sm0,
+        RM2_CLOCK_DIVIDER,
+        pio.irq0,
+        cs,
+        p.PIN_24,
+        p.PIN_29,
+        embassy_rp::dma::Channel::new(p.DMA_CH0, Irqs),
+    );
+
+    static STATE: StaticCell<cyw43::State> = StaticCell::new();
+    let state = STATE.init(cyw43::State::new());
+
+    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
+    spawner.spawn(unwrap!(cyw43_task(runner)));
+
+    control.init(clm).await;
+    control
+        .set_power_management(cyw43::PowerManagementMode::PowerSave)
+        .await;
+
+    // Configure UART
+    let uart_config = Config::default();
+    let uart = Uart::new(
+        p.UART0,
+        p.PIN_0,
+        p.PIN_1,
+        Irqs,
+        p.DMA_CH1,
+        p.DMA_CH2,
+        uart_config,
+    );
+
+    // PIN 28 LED
+    let led = Output::new(p.PIN_28, Level::Low);
+
+    // Spawn tasks
+    // Control implements Clone to allow multiple tasks to share ownership
+    spawner.spawn(unwrap!(blink_task(control)));
+    spawner.spawn(unwrap!(uart_task(uart, led)));
+
+    info!("Tasks spawned");
+    loop {
+        Timer::after(Duration::from_millis(1000)).await;
     }
 }
 
 /// Program metadata for `picotool info`
 #[unsafe(link_section = ".bi_entries")]
 #[used]
-pub static PICOTOOL_ENTRIES: [hal::binary_info::EntryAddr; 5] = [
-    hal::binary_info::rp_cargo_bin_name!(),
-    hal::binary_info::rp_cargo_version!(),
-    hal::binary_info::rp_program_description!(c"Blinky Example"),
-    hal::binary_info::rp_cargo_homepage_url!(),
-    hal::binary_info::rp_program_build_attribute!(),
+pub static PICOTOOL_ENTRIES: [embassy_rp::binary_info::EntryAddr; 4] = [
+    embassy_rp::binary_info::rp_program_name!(c"Pico 2W Embassy Shell"),
+    embassy_rp::binary_info::rp_cargo_version!(),
+    embassy_rp::binary_info::rp_program_description!(
+        c"Pico 2 W Embassy Shell with background LED and UART CLI"
+    ),
+    embassy_rp::binary_info::rp_program_build_attribute!(),
 ];
-
-// End of file
