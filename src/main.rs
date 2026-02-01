@@ -44,10 +44,10 @@ async fn blink_task(mut control: cyw43::Control<'static>) {
     loop {
         log_info!("Blink on");
         control.gpio_set(0, true).await;
-        Timer::after(Duration::from_millis(1000)).await;
+        Timer::after(Duration::from_millis(500)).await;
         log_info!("Blink off");
         control.gpio_set(0, false).await;
-        Timer::after(Duration::from_millis(1000)).await;
+        Timer::after(Duration::from_millis(500)).await;
     }
 }
 
