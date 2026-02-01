@@ -99,4 +99,4 @@ rustflags = [
 runner = "probe-rs run --chip RP235x --protocol swd"
 
 [env]
-DEFMT_LOG = "debug"
+DEFMT_LOG = "info"

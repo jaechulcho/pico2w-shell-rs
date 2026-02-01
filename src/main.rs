@@ -5,6 +5,7 @@
 #![no_main]
 
 mod cli;
+mod log_filter;
 
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
@@ -26,6 +27,9 @@ use panic_halt as _;
 #[cfg(target_arch = "arm")]
 use panic_probe as _;
 
+use crate::log_filter::LOG_LEVEL;
+use core::sync::atomic::Ordering;
+
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
     UART0_IRQ => UartInterruptHandler<UART0>;
@@ -38,8 +42,10 @@ bind_interrupts!(struct Irqs {
 #[embassy_executor::task]
 async fn blink_task(mut control: cyw43::Control<'static>) {
     loop {
+        log_info!("Blink on");
         control.gpio_set(0, true).await;
         Timer::after(Duration::from_millis(500)).await;
+        log_info!("Blink off");
         control.gpio_set(0, false).await;
         Timer::after(Duration::from_millis(500)).await;
     }
@@ -67,9 +73,6 @@ async fn uart_task(mut uart: Uart<'static, Async>, mut led: Output<'static>) {
         if let Ok(_) = uart.read(&mut byte).await {
             let c = byte[0];
 
-            // Echo
-            uart_write_all(&mut uart, &[c]).await;
-
             if c == b'\r' || c == b'\n' {
                 uart_write_all(&mut uart, b"\r\n").await;
                 if idx > 0 {
@@ -85,6 +88,8 @@ async fn uart_task(mut uart: Uart<'static, Async>, mut led: Output<'static>) {
                     uart_write_all(&mut uart, b"\x08 \x08").await;
                 }
             } else if idx < buf.len() {
+                // Echo standard characters
+                uart_write_all(&mut uart, &[c]).await;
                 buf[idx] = c;
                 idx += 1;
             }
@@ -102,7 +107,8 @@ async fn cyw43_task(runner: cyw43::Runner<'static, MyCywBus>) -> ! {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-    info!("Pico 2 W Embassy Start");
+    log_info!("Pico 2 W Embassy Start");
+    LOG_LEVEL.store(1, Ordering::Relaxed);
 
     // Include firmware
     // Note: Missing files in cyw43-firmware/ will cause build error.
@@ -156,7 +162,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(unwrap!(blink_task(control)));
     spawner.spawn(unwrap!(uart_task(uart, led)));
 
-    info!("Tasks spawned");
+    log_info!("Tasks spawned");
     loop {
         Timer::after(Duration::from_millis(1000)).await;
     }

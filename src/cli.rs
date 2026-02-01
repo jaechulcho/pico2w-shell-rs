@@ -114,6 +114,60 @@ impl Command for EchoCommand {
     }
 }
 
+pub struct LogCommand;
+impl Command for LogCommand {
+    fn name(&self) -> &str {
+        "log"
+    }
+    fn description(&self) -> &str {
+        "Set log level (error, warn, info, debug, trace)"
+    }
+    async fn exec(
+        &self,
+        uart: &mut Uart<'static, Async>,
+        _led: &mut Output<'static>,
+        args: &[&str],
+    ) {
+        use crate::log_filter::LOG_LEVEL;
+        use core::sync::atomic::Ordering;
+
+        if args.is_empty() {
+            let level = LOG_LEVEL.load(Ordering::Relaxed);
+            let level_str = match level {
+                0 => "error",
+                1 => "warn",
+                2 => "info",
+                3 => "debug",
+                4 => "trace",
+                _ => "unknown",
+            };
+            let _ = uart.write(b"Current log level: ").await;
+            let _ = uart.write(level_str.as_bytes()).await;
+            let _ = uart.write(b"\r\n").await;
+            return;
+        }
+
+        let new_level = match args[0] {
+            "error" => 0,
+            "warn" => 1,
+            "info" => 2,
+            "debug" => 3,
+            "trace" => 4,
+            _ => {
+                let _ = uart
+                    .write(b"Invalid level. Use: error, warn, info, debug, trace\r\n")
+                    .await;
+                return;
+            }
+        };
+
+        LOG_LEVEL.store(new_level, Ordering::Relaxed);
+        let _ = uart.write(b"Log level set to ").await;
+        let _ = uart.write(args[0].as_bytes()).await;
+        let _ = uart.write(b"\r\n").await;
+    }
+}
+
 pub async fn handle_command(
     line: &str,
     uart: &mut Uart<'static, Async>,
@@ -129,6 +183,7 @@ pub async fn handle_command(
             "led" => LedCommand.exec(uart, led, args).await,
             "info" => InfoCommand.exec(uart, led, args).await,
             "echo" => EchoCommand.exec(uart, led, args).await,
+            "log" => LogCommand.exec(uart, led, args).await,
             _ => {
                 let _ = uart.write(b"Unknown command: ").await;
                 let _ = uart.write(cmd_name.as_bytes()).await;
