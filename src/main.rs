@@ -15,12 +15,17 @@
 
 use defmt::*;
 use defmt_rtt as _;
-use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::OutputPin;
 #[cfg(target_arch = "riscv32")]
 use panic_halt as _;
 #[cfg(target_arch = "arm")]
 use panic_probe as _;
+
+use core::fmt::Write;
+use embedded_hal_nb::serial::{Read, Write as _};
+use fugit::RateExtU32;
+use hal::prelude::*;
+use hal::uart::{DataBits, StopBits, UartConfig};
 
 // Alias for our HAL crate
 use hal::entry;
@@ -82,12 +87,6 @@ fn main() -> ! {
     )
     .unwrap();
 
-    #[cfg(rp2040)]
-    let mut timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
-
-    #[cfg(rp2350)]
-    let mut timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
-
     // The single-cycle I/O block controls our GPIO pins
     let sio = hal::Sio::new(pac.SIO);
 
@@ -99,15 +98,87 @@ fn main() -> ! {
         &mut pac.RESETS,
     );
 
-    // Configure GPIO25 as an output
+    // Configure UART pins
+    let uart_pins = (
+        pins.gpio0.into_function::<hal::gpio::FunctionUart>(),
+        pins.gpio1.into_function::<hal::gpio::FunctionUart>(),
+    );
+
+    // Initialize UART
+    let uart = hal::uart::UartPeripheral::new(pac.UART0, uart_pins, &mut pac.RESETS)
+        .enable(
+            UartConfig::new(115_200.Hz(), DataBits::Eight, None, StopBits::One),
+            clocks.peripheral_clock.freq(),
+        )
+        .unwrap();
+
     let mut led_pin = pins.gpio28.into_push_pull_output();
+
+    // UART Writer for responses
+    let mut uart = uart;
+
+    writeln!(
+        uart,
+        "\r\nPico 2W Shell (Rust)\r\nType 'help' for commands.\r\n"
+    )
+    .unwrap();
+
+    let mut input_buf = [0u8; 64];
+    let mut input_idx = 0;
+
     loop {
-        info!("on!");
-        led_pin.set_high().unwrap();
-        timer.delay_ms(200);
-        info!("off!");
-        led_pin.set_low().unwrap();
-        timer.delay_ms(200);
+        // Read from UART (blocking for simplicity)
+        if let Ok(c) = nb::block!(uart.read()) {
+            // Echo back
+            let _ = nb::block!(uart.write(c));
+
+            if c == b'\r' || c == b'\n' {
+                let _ = uart.write_str("\r\n");
+                if input_idx > 0 {
+                    let cmd = core::str::from_utf8(&input_buf[..input_idx]).unwrap_or("");
+                    match cmd {
+                        "help" => {
+                            let _ = uart.write_str("Available commands:\r\n");
+                            let _ = uart.write_str("  help    - Show this help\r\n");
+                            let _ = uart.write_str("  led on  - Turn LED on\r\n");
+                            let _ = uart.write_str("  led off - Turn LED off\r\n");
+                            let _ = uart.write_str("  info    - Show system info\r\n");
+                        }
+                        "led on" => {
+                            led_pin.set_high().unwrap();
+                            let _ = uart.write_str("LED is ON\r\n");
+                        }
+                        "led off" => {
+                            led_pin.set_low().unwrap();
+                            let _ = uart.write_str("LED is OFF\r\n");
+                        }
+                        "info" => {
+                            let _ = uart.write_str("System: Raspberry Pi Pico series\r\n");
+                            #[cfg(rp2040)]
+                            let _ = uart.write_str("Chip: RP2040\r\n");
+                            #[cfg(rp2350)]
+                            let _ = uart.write_str("Chip: RP2350\r\n");
+                        }
+                        _ => {
+                            let _ = uart.write_str("Unknown command: ");
+                            let _ = uart.write_str(cmd);
+                            let _ = uart.write_str("\r\n");
+                        }
+                    }
+                    input_idx = 0;
+                }
+                let _ = uart.write_str("> ");
+            } else if c == 0x08 || c == 0x7F {
+                // Backspace
+                if input_idx > 0 {
+                    input_idx -= 1;
+                    let _ = uart.write_str("\x08 \x08");
+                }
+            } else if input_idx < input_buf.len() {
+                input_buf[input_idx] = c;
+                input_idx += 1;
+            }
+        }
     }
 }
 
