@@ -18,6 +18,7 @@ fugit = "0.3.7"
 defmt = "1"
 defmt-rtt = "1"
 static_cell = "2"
+heapless = "0.8"
 embassy-executor = { git = "https://github.com/embassy-rs/embassy.git", features = ["arch-cortex-m", "executor-thread", "defmt"] }
 embassy-time = { git = "https://github.com/embassy-rs/embassy.git", features = ["defmt", "defmt-timestamp-uptime"] }
 embassy-rp = { git = "https://github.com/embassy-rs/embassy.git", features = ["defmt", "rp235xa", "time-driver", "critical-section-impl", "binary-info"] }
@@ -25,7 +26,7 @@ embassy-usb = { git = "https://github.com/embassy-rs/embassy.git" }
 embassy-net = { git = "https://github.com/embassy-rs/embassy.git", features = ["defmt", "tcp", "udp", "dhcpv4"] }
 cyw43 = { git = "https://github.com/embassy-rs/embassy.git", features = ["defmt", "firmware-logs"] }
 cyw43-pio = { git = "https://github.com/embassy-rs/embassy.git" }
-embedded-io-async = "0.6.1"
+embedded-io-async = "0.7.0"
 assign-resources = "0.4.1"
 
 [target.'cfg( target_arch = "arm" )'.dependencies]

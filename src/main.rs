@@ -4,6 +4,8 @@
 #![no_std]
 #![no_main]
 
+mod cli;
+
 use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
 use defmt::*;
 use defmt_rtt as _;
@@ -12,9 +14,12 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, DMA_CH2, PIO0, UART0};
 use embassy_rp::pio::{InterruptHandler, Pio};
-use embassy_rp::uart::{Config, InterruptHandler as UartInterruptHandler, Uart};
+use embassy_rp::uart::{Async, Config, InterruptHandler as UartInterruptHandler, Uart};
 use embassy_time::{Duration, Timer};
 use static_cell::StaticCell;
+
+// Use trait for write_all
+//use embedded_io_async::Write;
 
 #[cfg(target_arch = "riscv32")]
 use panic_halt as _;
@@ -41,13 +46,13 @@ async fn blink_task(mut control: cyw43::Control<'static>) {
 }
 
 /// Helper to write all bytes to UART
-async fn uart_write_all(uart: &mut Uart<'static, embassy_rp::uart::Async>, buf: &[u8]) {
+async fn uart_write_all(uart: &mut Uart<'static, Async>, buf: &[u8]) {
     let _ = uart.write(buf).await;
 }
 
 /// Task to handle UART CLI
 #[embassy_executor::task]
-async fn uart_task(mut uart: Uart<'static, embassy_rp::uart::Async>, mut led: Output<'static>) {
+async fn uart_task(mut uart: Uart<'static, Async>, mut led: Output<'static>) {
     let mut buf = [0u8; 64];
     let mut idx = 0;
 
@@ -68,38 +73,8 @@ async fn uart_task(mut uart: Uart<'static, embassy_rp::uart::Async>, mut led: Ou
             if c == b'\r' || c == b'\n' {
                 uart_write_all(&mut uart, b"\r\n").await;
                 if idx > 0 {
-                    let cmd = core::str::from_utf8(&buf[..idx]).unwrap_or("");
-                    match cmd {
-                        "help" => {
-                            uart_write_all(&mut uart, b"Available commands:\r\n").await;
-                            uart_write_all(&mut uart, b"  help    - Show this help\r\n").await;
-                            uart_write_all(&mut uart, b"  led on  - Turn LED on\r\n").await;
-                            uart_write_all(&mut uart, b"  led off - Turn LED off\r\n").await;
-                            uart_write_all(&mut uart, b"  info    - Show system info\r\n").await;
-                        }
-                        "led on" => {
-                            // control.gpio_set(0, true).await;
-                            led.set_high();
-                            uart_write_all(&mut uart, b"LED is ON\r\n").await;
-                        }
-                        "led off" => {
-                            //control.gpio_set(0, false).await;
-                            led.set_low();
-                            uart_write_all(&mut uart, b"LED is OFF\r\n").await;
-                        }
-                        "info" => {
-                            uart_write_all(
-                                &mut uart,
-                                b"System: Raspberry Pi Pico 2 W (Embassy)\r\n",
-                            )
-                            .await;
-                            uart_write_all(&mut uart, b"Chip: RP2350\r\n").await;
-                        }
-                        _ => {
-                            uart_write_all(&mut uart, b"Unknown command: ").await;
-                            uart_write_all(&mut uart, cmd.as_bytes()).await;
-                            uart_write_all(&mut uart, b"\r\n").await;
-                        }
+                    if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
+                        cli::handle_command(line, &mut uart, &mut led).await;
                     }
                     idx = 0;
                 }
@@ -154,6 +129,7 @@ async fn main(spawner: Spawner) {
     let state = STATE.init(cyw43::State::new());
 
     let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
+    // Task spawning
     spawner.spawn(unwrap!(cyw43_task(runner)));
 
     control.init(clm).await;
@@ -177,7 +153,6 @@ async fn main(spawner: Spawner) {
     let led = Output::new(p.PIN_28, Level::Low);
 
     // Spawn tasks
-    // Control implements Clone to allow multiple tasks to share ownership
     spawner.spawn(unwrap!(blink_task(control)));
     spawner.spawn(unwrap!(uart_task(uart, led)));
 
