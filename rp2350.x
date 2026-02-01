@@ -1,18 +1,19 @@
 /*
-* SPDX-License-Identifier: MIT OR Apache-2.0
-*
-* Copyright (c) 2021–2024 The rp-rs Developers
-* Copyright (c) 2021 rp-rs organization
-* Copyright (c) 2025 Raspberry Pi Ltd.
-*/
+ * SPDX-License-Identifier: MIT OR Apache-2.0
+ *
+ * Copyright (c) 2021–2024 The rp-rs Developers
+ * Copyright (c) 2021 rp-rs organization
+ * Copyright (c) 2025 Raspberry Pi Ltd.
+ */
 
 MEMORY {
       /*
-      * The RP2350 has either external or internal flash.
-      *
-      * 2 MiB is a safe default here, although a Pico 2 has 4 MiB.
+      * Shifted for Bootloader:
+      * Bootloader: 0x10000000 (64K)
+      * Metadata:   0x10010000 (256B)
+      * App Start:  0x10010100
       */
-      FLASH : ORIGIN = 0x10000000, LENGTH = 2048K
+      FLASH : ORIGIN = 0x10010100, LENGTH = 1983K
       /*
       * RAM consists of 8 banks, SRAM0-SRAM7, with a striped mapping.
       * This is usually good for performance, as it distributes load on
@@ -31,10 +32,10 @@ MEMORY {
 
   SECTIONS {
       /* ### Boot ROM info
-      *
-      * Goes after .vector_table, to keep it in the first 4K of flash
-      * where the Boot ROM (and picotool) can find it
-      */
+       *
+       * Goes after .vector_table, to keep it in the first 4K of flash
+       * where the Boot ROM (and picotool) can find it
+       */
       .start_block : ALIGN(4)
       {
           __start_block_addr = .;
@@ -48,10 +49,10 @@ MEMORY {
 
   SECTIONS {
       /* ### Picotool 'Binary Info' Entries
-      *
-      * Picotool looks through this block (as we have pointers to it in our
-      * header) to find interesting information.
-      */
+       *
+       * Picotool looks through this block (as we have pointers to it in our
+       * header) to find interesting information.
+       */
       .bi_entries : ALIGN(4)
       {
           /* We put this in the header */
@@ -67,9 +68,9 @@ MEMORY {
 
   SECTIONS {
       /* ### Boot ROM extra info
-      *
-      * Goes after everything in our program, so it can contain a signature.
-      */
+       *
+       * Goes after everything in our program, so it can contain a signature.
+       */
       .end_block : ALIGN(4)
       {
           __end_block_addr = .;
@@ -80,4 +81,3 @@ MEMORY {
 
   PROVIDE(start_to_end = __end_block_addr - __start_block_addr);
   PROVIDE(end_to_start = __start_block_addr - __end_block_addr);
-  
