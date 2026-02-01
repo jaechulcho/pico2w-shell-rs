@@ -29,6 +29,9 @@ impl Command for HelpCommand {
             .await;
         let _ = uart.write(b"  info    - Show system info\r\n").await;
         let _ = uart.write(b"  echo <msg>    - Echo the message\r\n").await;
+        let _ = uart
+            .write(b"  reboot  - Reset the system to bootloader\r\n")
+            .await;
     }
 }
 
@@ -168,6 +171,27 @@ impl Command for LogCommand {
     }
 }
 
+pub struct RebootCommand;
+impl Command for RebootCommand {
+    fn name(&self) -> &str {
+        "reboot"
+    }
+    fn description(&self) -> &str {
+        "Reset the system"
+    }
+    async fn exec(
+        &self,
+        uart: &mut Uart<'static, Async>,
+        _led: &mut Output<'static>,
+        _args: &[&str],
+    ) {
+        let _ = uart.write(b"Rebooting to bootloader...\r\n").await;
+        // Wait a bit for the message to be sent
+        embassy_time::Timer::after_millis(100).await;
+        cortex_m::peripheral::SCB::sys_reset();
+    }
+}
+
 pub async fn handle_command(
     line: &str,
     uart: &mut Uart<'static, Async>,
@@ -184,6 +208,7 @@ pub async fn handle_command(
             "info" => InfoCommand.exec(uart, led, args).await,
             "echo" => EchoCommand.exec(uart, led, args).await,
             "log" => LogCommand.exec(uart, led, args).await,
+            "reboot" => RebootCommand.exec(uart, led, args).await,
             _ => {
                 let _ = uart.write(b"Unknown command: ").await;
                 let _ = uart.write(cmd_name.as_bytes()).await;
