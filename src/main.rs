@@ -4,6 +4,7 @@
 #![no_std]
 #![no_main]
 
+mod ble;
 mod cli;
 mod log_filter;
 
@@ -18,9 +19,7 @@ use embassy_rp::pio::{InterruptHandler, Pio};
 use embassy_rp::uart::{Async, Config, InterruptHandler as UartInterruptHandler, Uart};
 use embassy_time::{Duration, Timer};
 use static_cell::StaticCell;
-
-// Use trait for write_all
-//use embedded_io_async::Write;
+use trouble_host::prelude::ExternalController;
 
 #[cfg(target_arch = "riscv32")]
 use panic_halt as _;
@@ -42,10 +41,8 @@ bind_interrupts!(struct Irqs {
 #[embassy_executor::task]
 async fn blink_task(mut control: cyw43::Control<'static>) {
     loop {
-        log_info!("Blink on");
         control.gpio_set(0, true).await;
         Timer::after(Duration::from_millis(500)).await;
-        log_info!("Blink off");
         control.gpio_set(0, false).await;
         Timer::after(Duration::from_millis(500)).await;
     }
@@ -54,6 +51,13 @@ async fn blink_task(mut control: cyw43::Control<'static>) {
 /// Helper to write all bytes to UART
 async fn uart_write_all(uart: &mut Uart<'static, Async>, buf: &[u8]) {
     let _ = uart.write(buf).await;
+    // Also send to BLE TX Channel
+    if buf.len() > 0 {
+        let mut vec = heapless::Vec::new();
+        // Break into 64-byte chunks if needed, but for now just send what fits
+        let _ = vec.extend_from_slice(&buf[..core::cmp::min(buf.len(), 64)]);
+        let _ = ble::BLE_TX_CHANNEL.try_send(vec);
+    }
 }
 
 /// Task to handle UART CLI
@@ -64,34 +68,66 @@ async fn uart_task(mut uart: Uart<'static, Async>, mut led: Output<'static>) {
 
     uart_write_all(
         &mut uart,
-        b"\r\nPico 2W Shell (Embassy)\r\nType 'help' for commands.\r\n> ",
+        b"\r\nPico 2W Shell (Embassy with BLE)\r\nType 'help' for commands.\r\n> ",
     )
     .await;
 
     loop {
         let mut byte = [0u8; 1];
-        if let Ok(_) = uart.read(&mut byte).await {
-            let c = byte[0];
 
-            if c == b'\r' || c == b'\n' {
-                uart_write_all(&mut uart, b"\r\n").await;
-                if idx > 0 {
-                    if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
-                        cli::handle_command(line, &mut uart, &mut led).await;
+        // Select between UART read and BLE RX Channel
+        let c_opt =
+            embassy_futures::select::select(uart.read(&mut byte), ble::BLE_RX_CHANNEL.receive())
+                .await;
+
+        match c_opt {
+            embassy_futures::select::Either::First(result) => {
+                if let Ok(_) = result {
+                    let c = byte[0];
+                    if c == b'\r' || c == b'\n' {
+                        uart_write_all(&mut uart, b"\r\n").await;
+                        if idx > 0 {
+                            if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
+                                cli::handle_command(line, &mut uart, &mut led).await;
+                            }
+                            idx = 0;
+                        }
+                        uart_write_all(&mut uart, b"> ").await;
+                    } else if c == 0x08 || c == 0x7F {
+                        if idx > 0 {
+                            idx -= 1;
+                            uart_write_all(&mut uart, b"\x08 \x08").await;
+                        }
+                    } else if idx < buf.len() {
+                        uart_write_all(&mut uart, &[c]).await;
+                        buf[idx] = c;
+                        idx += 1;
                     }
-                    idx = 0;
                 }
-                uart_write_all(&mut uart, b"> ").await;
-            } else if c == 0x08 || c == 0x7F {
-                if idx > 0 {
-                    idx -= 1;
-                    uart_write_all(&mut uart, b"\x08 \x08").await;
+            }
+            embassy_futures::select::Either::Second(ble_data) => {
+                // Command received from BLE, process it line by line
+                for &c in ble_data.iter() {
+                    if c == b'\r' || c == b'\n' {
+                        uart_write_all(&mut uart, b"\r\n").await;
+                        if idx > 0 {
+                            if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
+                                cli::handle_command(line, &mut uart, &mut led).await;
+                            }
+                            idx = 0;
+                        }
+                        uart_write_all(&mut uart, b"> ").await;
+                    } else if c == 0x08 || c == 0x7F {
+                        if idx > 0 {
+                            idx -= 1;
+                            uart_write_all(&mut uart, b"\x08 \x08").await;
+                        }
+                    } else if idx < buf.len() {
+                        uart_write_all(&mut uart, &[c]).await;
+                        buf[idx] = c;
+                        idx += 1;
+                    }
                 }
-            } else if idx < buf.len() {
-                // Echo standard characters
-                uart_write_all(&mut uart, &[c]).await;
-                buf[idx] = c;
-                idx += 1;
             }
         }
     }
@@ -104,16 +140,21 @@ async fn cyw43_task(runner: cyw43::Runner<'static, MyCywBus>) -> ! {
     runner.run().await
 }
 
+#[embassy_executor::task]
+async fn ble_host_task(bt_device: cyw43::bluetooth::BtDriver<'static>) {
+    let controller: ExternalController<_, 10> = ExternalController::new(bt_device);
+    ble::run_ble(controller).await;
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
     log_info!("Pico 2 W Embassy Start");
     LOG_LEVEL.store(1, Ordering::Relaxed);
 
-    // Include firmware
-    // Note: Missing files in cyw43-firmware/ will cause build error.
     let fw = cyw43::aligned_bytes!("../cyw43-firmware/43439A0.bin");
     let clm = cyw43::aligned_bytes!("../cyw43-firmware/43439A0_clm.bin");
+    let btfw = cyw43::aligned_bytes!("../cyw43-firmware/43439A0_btfw.bin");
     let nvram = cyw43::aligned_bytes!("../cyw43-firmware/nvram_rp2040.bin");
 
     let pwr = Output::new(p.PIN_23, Level::Low);
@@ -134,9 +175,11 @@ async fn main(spawner: Spawner) {
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
     let state = STATE.init(cyw43::State::new());
 
-    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
-    // Task spawning
+    let (_net_device, bt_device, mut control, runner) =
+        cyw43::new_with_bluetooth(state, pwr, spi, fw, btfw, nvram).await;
+
     spawner.spawn(unwrap!(cyw43_task(runner)));
+    spawner.spawn(unwrap!(ble_host_task(bt_device)));
 
     control.init(clm).await;
     control
