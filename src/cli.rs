@@ -2,6 +2,19 @@ use embassy_rp::gpio::Output;
 use embassy_rp::uart::{Async, Uart};
 //use embedded_io_async::Write;
 
+use crate::ble;
+
+pub async fn uart_write_all(uart: &mut Uart<'static, Async>, buf: &[u8]) {
+    let _ = uart.write(buf).await;
+    // Also send to BLE TX Channel
+    if buf.len() > 0 {
+        let mut vec = heapless::Vec::new();
+        // Break into 64-byte chunks if needed, but for now just send what fits
+        let _ = vec.extend_from_slice(&buf[..core::cmp::min(buf.len(), 64)]);
+        let _ = ble::BLE_TX_CHANNEL.try_send(vec);
+    }
+}
+
 pub trait Command {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
@@ -22,16 +35,12 @@ impl Command for HelpCommand {
         _led: &mut Output<'static>,
         _args: &[&str],
     ) {
-        let _ = uart.write(b"Available commands:\r\n").await;
-        let _ = uart.write(b"  help    - Show this help\r\n").await;
-        let _ = uart
-            .write(b"  led <on|off> - Control the GP28 LED\r\n")
-            .await;
-        let _ = uart.write(b"  info    - Show system info\r\n").await;
-        let _ = uart.write(b"  echo <msg>    - Echo the message\r\n").await;
-        let _ = uart
-            .write(b"  reboot  - Reset the system to bootloader\r\n")
-            .await;
+        uart_write_all(uart, b"Available commands:\r\n").await;
+        uart_write_all(uart, b"  help    - Show this help\r\n").await;
+        uart_write_all(uart, b"  led <on|off> - Control the GP28 LED\r\n").await;
+        uart_write_all(uart, b"  info    - Show system info\r\n").await;
+        uart_write_all(uart, b"  echo <msg>    - Echo the message\r\n").await;
+        uart_write_all(uart, b"  reboot  - Reset the system to bootloader\r\n").await;
     }
 }
 
@@ -50,23 +59,21 @@ impl Command for LedCommand {
         args: &[&str],
     ) {
         if args.is_empty() {
-            let _ = uart.write(b"Usage: led <on|off>\r\n").await;
+            uart_write_all(uart, b"Usage: led <on|off>\r\n").await;
             return;
         }
 
         match args[0] {
             "on" => {
                 led.set_high();
-                let _ = uart.write(b"LED is ON\r\n").await;
+                uart_write_all(uart, b"LED is ON\r\n").await;
             }
             "off" => {
                 led.set_low();
-                let _ = uart.write(b"LED is OFF\r\n").await;
+                uart_write_all(uart, b"LED is OFF\r\n").await;
             }
             _ => {
-                let _ = uart
-                    .write(b"Unknown LED state. Use 'on' or 'off'.\r\n")
-                    .await;
+                uart_write_all(uart, b"Unknown LED state. Use 'on' or 'off'.\r\n").await;
             }
         }
     }
@@ -86,10 +93,8 @@ impl Command for InfoCommand {
         _led: &mut Output<'static>,
         _args: &[&str],
     ) {
-        let _ = uart
-            .write(b"System: Raspberry Pi Pico 2 W (Embassy)\r\n")
-            .await;
-        let _ = uart.write(b"Chip: RP2350\r\n").await;
+        uart_write_all(uart, b"System: Raspberry Pi Pico 2 W (Embassy)\r\n").await;
+        uart_write_all(uart, b"Chip: RP2350\r\n").await;
     }
 }
 
@@ -108,12 +113,12 @@ impl Command for EchoCommand {
         args: &[&str],
     ) {
         for (i, arg) in args.iter().enumerate() {
-            let _ = uart.write(arg.as_bytes()).await;
+            uart_write_all(uart, arg.as_bytes()).await;
             if i < args.len() - 1 {
-                let _ = uart.write(b" ").await;
+                uart_write_all(uart, b" ").await;
             }
         }
-        let _ = uart.write(b"\r\n").await;
+        uart_write_all(uart, b"\r\n").await;
     }
 }
 
@@ -144,9 +149,9 @@ impl Command for LogCommand {
                 4 => "trace",
                 _ => "unknown",
             };
-            let _ = uart.write(b"Current log level: ").await;
-            let _ = uart.write(level_str.as_bytes()).await;
-            let _ = uart.write(b"\r\n").await;
+            let _ = uart_write_all(uart, b"Current log level: ").await;
+            let _ = uart_write_all(uart, level_str.as_bytes()).await;
+            let _ = uart_write_all(uart, b"\r\n").await;
             return;
         }
 
@@ -157,17 +162,19 @@ impl Command for LogCommand {
             "debug" => 3,
             "trace" => 4,
             _ => {
-                let _ = uart
-                    .write(b"Invalid level. Use: error, warn, info, debug, trace\r\n")
-                    .await;
+                let _ = uart_write_all(
+                    uart,
+                    b"Invalid level. Use: error, warn, info, debug, trace\r\n",
+                )
+                .await;
                 return;
             }
         };
 
         LOG_LEVEL.store(new_level, Ordering::Relaxed);
-        let _ = uart.write(b"Log level set to ").await;
-        let _ = uart.write(args[0].as_bytes()).await;
-        let _ = uart.write(b"\r\n").await;
+        let _ = uart_write_all(uart, b"Log level set to ").await;
+        let _ = uart_write_all(uart, args[0].as_bytes()).await;
+        let _ = uart_write_all(uart, b"\r\n").await;
     }
 }
 
@@ -185,7 +192,7 @@ impl Command for RebootCommand {
         _led: &mut Output<'static>,
         _args: &[&str],
     ) {
-        let _ = uart.write(b"Rebooting to bootloader...\r\n").await;
+        uart_write_all(uart, b"Rebooting to bootloader...\r\n").await;
         // Wait a bit for the message to be sent
         embassy_time::Timer::after_millis(100).await;
         cortex_m::peripheral::SCB::sys_reset();
@@ -210,9 +217,9 @@ pub async fn handle_command(
             "log" => LogCommand.exec(uart, led, args).await,
             "reboot" => RebootCommand.exec(uart, led, args).await,
             _ => {
-                let _ = uart.write(b"Unknown command: ").await;
-                let _ = uart.write(cmd_name.as_bytes()).await;
-                let _ = uart.write(b"\r\n").await;
+                uart_write_all(uart, b"Unknown command: ").await;
+                uart_write_all(uart, cmd_name.as_bytes()).await;
+                uart_write_all(uart, b"\r\n").await;
             }
         }
     }

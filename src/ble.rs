@@ -2,7 +2,7 @@ use defmt::*;
 use embassy_futures::join::join;
 use embassy_futures::select::select;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::{Channel, Receiver, Sender};
+use embassy_sync::channel::Channel;
 use trouble_host::prelude::*;
 
 const CONNECTIONS_MAX: usize = 1;

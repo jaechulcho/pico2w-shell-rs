@@ -26,9 +26,6 @@ use panic_halt as _;
 #[cfg(target_arch = "arm")]
 use panic_probe as _;
 
-use crate::log_filter::LOG_LEVEL;
-use core::sync::atomic::Ordering;
-
 bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => InterruptHandler<PIO0>;
     UART0_IRQ => UartInterruptHandler<UART0>;
@@ -48,25 +45,13 @@ async fn blink_task(mut control: cyw43::Control<'static>) {
     }
 }
 
-/// Helper to write all bytes to UART
-async fn uart_write_all(uart: &mut Uart<'static, Async>, buf: &[u8]) {
-    let _ = uart.write(buf).await;
-    // Also send to BLE TX Channel
-    if buf.len() > 0 {
-        let mut vec = heapless::Vec::new();
-        // Break into 64-byte chunks if needed, but for now just send what fits
-        let _ = vec.extend_from_slice(&buf[..core::cmp::min(buf.len(), 64)]);
-        let _ = ble::BLE_TX_CHANNEL.try_send(vec);
-    }
-}
-
 /// Task to handle UART CLI
 #[embassy_executor::task]
 async fn uart_task(mut uart: Uart<'static, Async>, mut led: Output<'static>) {
     let mut buf = [0u8; 64];
     let mut idx = 0;
 
-    uart_write_all(
+    cli::uart_write_all(
         &mut uart,
         b"\r\nPico 2W Shell (Embassy with BLE)\r\nType 'help' for commands.\r\n> ",
     )
@@ -85,21 +70,21 @@ async fn uart_task(mut uart: Uart<'static, Async>, mut led: Output<'static>) {
                 Ok(_) => {
                     let c = byte[0];
                     if c == b'\r' || c == b'\n' {
-                        uart_write_all(&mut uart, b"\r\n").await;
+                        cli::uart_write_all(&mut uart, b"\r\n").await;
                         if idx > 0 {
                             if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
                                 cli::handle_command(line, &mut uart, &mut led).await;
                             }
                             idx = 0;
                         }
-                        uart_write_all(&mut uart, b"> ").await;
+                        cli::uart_write_all(&mut uart, b"> ").await;
                     } else if c == 0x08 || c == 0x7F {
                         if idx > 0 {
                             idx -= 1;
-                            uart_write_all(&mut uart, b"\x08 \x08").await;
+                            cli::uart_write_all(&mut uart, b"\x08 \x08").await;
                         }
                     } else if idx < buf.len() {
-                        uart_write_all(&mut uart, &[c]).await;
+                        cli::uart_write_all(&mut uart, &[c]).await;
                         buf[idx] = c;
                         idx += 1;
                     }
@@ -113,21 +98,21 @@ async fn uart_task(mut uart: Uart<'static, Async>, mut led: Output<'static>) {
                 // Command received from BLE, process it line by line
                 for &c in ble_data.iter() {
                     if c == b'\r' || c == b'\n' {
-                        uart_write_all(&mut uart, b"\r\n").await;
+                        cli::uart_write_all(&mut uart, b"\r\n").await;
                         if idx > 0 {
                             if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
                                 cli::handle_command(line, &mut uart, &mut led).await;
                             }
                             idx = 0;
                         }
-                        uart_write_all(&mut uart, b"> ").await;
+                        cli::uart_write_all(&mut uart, b"> ").await;
                     } else if c == 0x08 || c == 0x7F {
                         if idx > 0 {
                             idx -= 1;
-                            uart_write_all(&mut uart, b"\x08 \x08").await;
+                            cli::uart_write_all(&mut uart, b"\x08 \x08").await;
                         }
                     } else if idx < buf.len() {
-                        uart_write_all(&mut uart, &[c]).await;
+                        cli::uart_write_all(&mut uart, &[c]).await;
                         buf[idx] = c;
                         idx += 1;
                     }
