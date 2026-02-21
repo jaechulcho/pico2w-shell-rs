@@ -8,7 +8,7 @@ mod ble;
 mod cli;
 mod log_filter;
 
-use cyw43_pio::{PioSpi, RM2_CLOCK_DIVIDER};
+use cyw43_pio::PioSpi;
 use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
@@ -149,8 +149,9 @@ async fn ble_host_task(bt_device: cyw43::bluetooth::BtDriver<'static>) {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
-    log_info!("Pico 2 W Embassy Start");
-    LOG_LEVEL.store(1, Ordering::Relaxed);
+    // Give RTT a moment to connect
+    Timer::after(Duration::from_millis(500)).await;
+    defmt::info!("Pico 2 W Embassy Start (defmt)");
 
     let fw = cyw43::aligned_bytes!("../cyw43-firmware/43439A0.bin");
     let clm = cyw43::aligned_bytes!("../cyw43-firmware/43439A0_clm.bin");
@@ -164,7 +165,7 @@ async fn main(spawner: Spawner) {
     let spi = PioSpi::new(
         &mut pio.common,
         pio.sm0,
-        RM2_CLOCK_DIVIDER,
+        cyw43_pio::DEFAULT_CLOCK_DIVIDER,
         pio.irq0,
         cs,
         p.PIN_24,
@@ -179,12 +180,13 @@ async fn main(spawner: Spawner) {
         cyw43::new_with_bluetooth(state, pwr, spi, fw, btfw, nvram).await;
 
     spawner.spawn(unwrap!(cyw43_task(runner)));
-    spawner.spawn(unwrap!(ble_host_task(bt_device)));
 
     control.init(clm).await;
     control
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
+
+    spawner.spawn(unwrap!(ble_host_task(bt_device)));
 
     // Configure UART
     let uart_config = Config::default();

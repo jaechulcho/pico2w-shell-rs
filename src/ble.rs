@@ -36,13 +36,20 @@ pub async fn run_ble<C>(controller: C)
 where
     C: Controller,
 {
-    // Fixed address for testing
-    let address: Address = Address::random([0xff, 0x8f, 0x1a, 0x05, 0xe4, 0xff]);
-    info!("BLE Address = {:?}", address);
+    defmt::info!("[run_ble] Started");
+
+    // Fixed address for testing without RNG dependency
+    let address = Address {
+        kind: AddrKind::RANDOM,
+        addr: BdAddr::new([0xff, 0x8f, 0x1a, 0x05, 0xe4, 0xff]),
+    };
+    info!("BLE Address configured (static random, no RNG)");
 
     let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
         HostResources::new();
+
     let stack = trouble_host::new(controller, &mut resources).set_random_address(address);
+
     let Host {
         mut peripheral,
         runner,
@@ -50,6 +57,7 @@ where
     } = stack.build();
 
     info!("Starting advertising and GATT service");
+
     let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
         name: "Pico 2W Shell",
         appearance: &appearance::power_device::GENERIC_POWER_DEVICE,
@@ -139,24 +147,29 @@ async fn advertise<'values, 'server, C: Controller>(
     server: &'server Server<'values>,
 ) -> Result<GattConnection<'values, 'server, DefaultPacketPool>, BleHostError<C::Error>> {
     let mut advertiser_data = [0; 31];
-    let len = AdStructure::encode_slice(
+    let adv_len = AdStructure::encode_slice(
         &[
             AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
             AdStructure::ServiceUuids128(&[[
                 0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x01, 0x00,
                 0x40, 0x6E,
             ]]),
-            AdStructure::CompleteLocalName(name.as_bytes()),
         ],
         &mut advertiser_data[..],
+    )?;
+
+    let mut scan_data = [0; 31];
+    let scan_len = AdStructure::encode_slice(
+        &[AdStructure::CompleteLocalName(name.as_bytes())],
+        &mut scan_data[..],
     )?;
 
     let advertiser = peripheral
         .advertise(
             &Default::default(),
             Advertisement::ConnectableScannableUndirected {
-                adv_data: &advertiser_data[..len],
-                scan_data: &[],
+                adv_data: &advertiser_data[..adv_len],
+                scan_data: &scan_data[..scan_len],
             },
         )
         .await?;
