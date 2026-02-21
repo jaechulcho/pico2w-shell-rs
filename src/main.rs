@@ -81,8 +81,8 @@ async fn uart_task(mut uart: Uart<'static, Async>, mut led: Output<'static>) {
                 .await;
 
         match c_opt {
-            embassy_futures::select::Either::First(result) => {
-                if let Ok(_) = result {
+            embassy_futures::select::Either::First(result) => match result {
+                Ok(_) => {
                     let c = byte[0];
                     if c == b'\r' || c == b'\n' {
                         uart_write_all(&mut uart, b"\r\n").await;
@@ -104,7 +104,11 @@ async fn uart_task(mut uart: Uart<'static, Async>, mut led: Output<'static>) {
                         idx += 1;
                     }
                 }
-            }
+                Err(e) => {
+                    defmt::error!("UART Read Error: {:?}", defmt::Debug2Format(&e));
+                    embassy_time::Timer::after(embassy_time::Duration::from_millis(10)).await;
+                }
+            },
             embassy_futures::select::Either::Second(ble_data) => {
                 // Command received from BLE, process it line by line
                 for &c in ble_data.iter() {
