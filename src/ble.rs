@@ -32,7 +32,7 @@ pub struct NordicUartService {
     pub tx: heapless::Vec<u8, 64>,
 }
 
-pub async fn run_ble<C>(controller: C)
+pub async fn run_ble<C>(controller: C, device_name: &'static str)
 where
     C: Controller,
 {
@@ -59,14 +59,14 @@ where
     info!("Starting advertising and GATT service");
 
     let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
-        name: "Pico 2W Shell",
+        name: device_name,
         appearance: &appearance::power_device::GENERIC_POWER_DEVICE,
     }))
     .unwrap();
 
     let _ = join(ble_task(runner), async {
         loop {
-            match advertise("Pico 2W Shell", &mut peripheral, &server).await {
+            match advertise(device_name, &mut peripheral, &server).await {
                 Ok(conn) => {
                     info!("BLE Client connected");
                     let a = gatt_events_task(&server, &conn);

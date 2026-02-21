@@ -31,7 +31,8 @@ bind_interrupts!(struct Irqs {
     UART0_IRQ => UartInterruptHandler<UART0>;
     DMA_IRQ_0 => embassy_rp::dma::InterruptHandler<DMA_CH0>,
                  embassy_rp::dma::InterruptHandler<DMA_CH1>,
-                 embassy_rp::dma::InterruptHandler<DMA_CH2>;
+                 embassy_rp::dma::InterruptHandler<DMA_CH2>,
+                 embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH3>;
 });
 
 /// Background task to blink the CYW43 LED
@@ -47,7 +48,11 @@ async fn blink_task(mut control: cyw43::Control<'static>) {
 
 /// Task to handle UART CLI
 #[embassy_executor::task]
-async fn uart_task(mut uart: Uart<'static, Async>, mut led: Output<'static>) {
+async fn uart_task(
+    mut uart: Uart<'static, Async>,
+    mut led: Output<'static>,
+    uid_str: &'static str,
+) {
     let mut buf = [0u8; 64];
     let mut idx = 0;
 
@@ -73,7 +78,7 @@ async fn uart_task(mut uart: Uart<'static, Async>, mut led: Output<'static>) {
                         cli::uart_write_all(&mut uart, b"\r\n").await;
                         if idx > 0 {
                             if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
-                                cli::handle_command(line, &mut uart, &mut led).await;
+                                cli::handle_command(line, &mut uart, &mut led, uid_str).await;
                             }
                             idx = 0;
                         }
@@ -101,7 +106,7 @@ async fn uart_task(mut uart: Uart<'static, Async>, mut led: Output<'static>) {
                         cli::uart_write_all(&mut uart, b"\r\n").await;
                         if idx > 0 {
                             if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
-                                cli::handle_command(line, &mut uart, &mut led).await;
+                                cli::handle_command(line, &mut uart, &mut led, uid_str).await;
                             }
                             idx = 0;
                         }
@@ -130,9 +135,9 @@ async fn cyw43_task(runner: cyw43::Runner<'static, MyCywBus>) -> ! {
 }
 
 #[embassy_executor::task]
-async fn ble_host_task(bt_device: cyw43::bluetooth::BtDriver<'static>) {
+async fn ble_host_task(bt_device: cyw43::bluetooth::BtDriver<'static>, device_name: &'static str) {
     let controller: ExternalController<_, 10> = ExternalController::new(bt_device);
-    ble::run_ble(controller).await;
+    ble::run_ble(controller, device_name).await;
 }
 
 #[embassy_executor::main]
@@ -141,6 +146,32 @@ async fn main(spawner: Spawner) {
     // Give RTT a moment to connect
     Timer::after(Duration::from_millis(500)).await;
     defmt::info!("Pico 2 W Embassy Start (defmt)");
+
+    // Read the 64-bit random chip ID from RP2350 OTP rows 0x0-0x3
+    let uid_u64 = embassy_rp::otp::get_chipid().unwrap_or(0);
+    let uid = uid_u64.to_be_bytes();
+
+    defmt::info!("RP2350 OTP Chip ID: {:a}", uid);
+
+    // Create formatted strings
+    static UID_STR: StaticCell<heapless::String<64>> = StaticCell::new();
+    let uid_str = UID_STR.init(heapless::String::new());
+    core::fmt::write(
+        uid_str,
+        format_args!(
+            "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+            uid[0], uid[1], uid[2], uid[3], uid[4], uid[5], uid[6], uid[7]
+        ),
+    )
+    .unwrap();
+
+    static BLE_NAME: StaticCell<heapless::String<64>> = StaticCell::new();
+    let ble_name = BLE_NAME.init(heapless::String::new());
+    core::fmt::write(
+        ble_name,
+        format_args!("Pico 2W Shell {:02X}{:02X}{:02X}", uid[5], uid[6], uid[7]),
+    )
+    .unwrap();
 
     let fw = cyw43::aligned_bytes!("../cyw43-firmware/43439A0.bin");
     let clm = cyw43::aligned_bytes!("../cyw43-firmware/43439A0_clm.bin");
@@ -175,7 +206,7 @@ async fn main(spawner: Spawner) {
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
 
-    spawner.spawn(unwrap!(ble_host_task(bt_device)));
+    spawner.spawn(unwrap!(ble_host_task(bt_device, ble_name.as_str())));
 
     // Configure UART
     let uart_config = Config::default();
@@ -185,7 +216,7 @@ async fn main(spawner: Spawner) {
         p.PIN_1,
         Irqs,
         p.DMA_CH1,
-        p.DMA_CH2,
+        p.DMA_CH3, // Instead of CH2 which Flash consumed
         uart_config,
     );
 
@@ -194,7 +225,7 @@ async fn main(spawner: Spawner) {
 
     // Spawn tasks
     spawner.spawn(unwrap!(blink_task(control)));
-    spawner.spawn(unwrap!(uart_task(uart, led)));
+    spawner.spawn(unwrap!(uart_task(uart, led, uid_str.as_str())));
 
     log_info!("Tasks spawned");
     loop {

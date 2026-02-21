@@ -18,7 +18,13 @@ pub async fn uart_write_all(uart: &mut Uart<'static, Async>, buf: &[u8]) {
 pub trait Command {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
-    async fn exec(&self, uart: &mut Uart<'static, Async>, led: &mut Output<'static>, args: &[&str]);
+    async fn exec(
+        &self,
+        uart: &mut Uart<'static, Async>,
+        led: &mut Output<'static>,
+        args: &[&str],
+        uid_str: &str,
+    );
 }
 
 pub struct HelpCommand;
@@ -34,6 +40,7 @@ impl Command for HelpCommand {
         uart: &mut Uart<'static, Async>,
         _led: &mut Output<'static>,
         _args: &[&str],
+        _uid_str: &str,
     ) {
         uart_write_all(uart, b"Available commands:\r\n").await;
         uart_write_all(uart, b"  help    - Show this help\r\n").await;
@@ -57,6 +64,7 @@ impl Command for LedCommand {
         uart: &mut Uart<'static, Async>,
         led: &mut Output<'static>,
         args: &[&str],
+        _uid_str: &str,
     ) {
         if args.is_empty() {
             uart_write_all(uart, b"Usage: led <on|off>\r\n").await;
@@ -92,9 +100,14 @@ impl Command for InfoCommand {
         uart: &mut Uart<'static, Async>,
         _led: &mut Output<'static>,
         _args: &[&str],
+        uid_str: &str,
     ) {
-        uart_write_all(uart, b"System: Raspberry Pi Pico 2 W (Embassy)\r\n").await;
-        uart_write_all(uart, b"Chip: RP2350\r\n").await;
+        uart_write_all(uart, b"System: Raspberry Pi Pico 2 W\r\n").await;
+        uart_write_all(uart, b"CPU: RP2350 (RISC-V/ARM)\r\n").await;
+        uart_write_all(uart, b"WiFi/BLE: CYW43439\r\n").await;
+        uart_write_all(uart, b"UID: ").await;
+        uart_write_all(uart, uid_str.as_bytes()).await;
+        uart_write_all(uart, b"\r\n").await;
     }
 }
 
@@ -111,6 +124,7 @@ impl Command for EchoCommand {
         uart: &mut Uart<'static, Async>,
         _led: &mut Output<'static>,
         args: &[&str],
+        _uid_str: &str,
     ) {
         for (i, arg) in args.iter().enumerate() {
             uart_write_all(uart, arg.as_bytes()).await;
@@ -135,6 +149,7 @@ impl Command for LogCommand {
         uart: &mut Uart<'static, Async>,
         _led: &mut Output<'static>,
         args: &[&str],
+        _uid_str: &str,
     ) {
         use crate::log_filter::LOG_LEVEL;
         use core::sync::atomic::Ordering;
@@ -191,6 +206,7 @@ impl Command for RebootCommand {
         uart: &mut Uart<'static, Async>,
         _led: &mut Output<'static>,
         _args: &[&str],
+        _uid_str: &str,
     ) {
         uart_write_all(uart, b"Rebooting to bootloader...\r\n").await;
         // Wait a bit for the message to be sent
@@ -203,6 +219,7 @@ pub async fn handle_command(
     line: &str,
     uart: &mut Uart<'static, Async>,
     led: &mut Output<'static>,
+    uid_str: &str,
 ) {
     let mut parts = line.split_whitespace();
     if let Some(cmd_name) = parts.next() {
@@ -210,12 +227,12 @@ pub async fn handle_command(
         let args = &args_vec;
 
         match cmd_name {
-            "help" => HelpCommand.exec(uart, led, args).await,
-            "led" => LedCommand.exec(uart, led, args).await,
-            "info" => InfoCommand.exec(uart, led, args).await,
-            "echo" => EchoCommand.exec(uart, led, args).await,
-            "log" => LogCommand.exec(uart, led, args).await,
-            "reboot" => RebootCommand.exec(uart, led, args).await,
+            "help" => HelpCommand.exec(uart, led, args, uid_str).await,
+            "led" => LedCommand.exec(uart, led, args, uid_str).await,
+            "info" => InfoCommand.exec(uart, led, args, uid_str).await,
+            "echo" => EchoCommand.exec(uart, led, args, uid_str).await,
+            "log" => LogCommand.exec(uart, led, args, uid_str).await,
+            "reboot" => RebootCommand.exec(uart, led, args, uid_str).await,
             _ => {
                 uart_write_all(uart, b"Unknown command: ").await;
                 uart_write_all(uart, cmd_name.as_bytes()).await;
