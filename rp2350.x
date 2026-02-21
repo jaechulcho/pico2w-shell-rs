@@ -13,7 +13,7 @@ MEMORY {
       * Metadata:   0x10010000 (256B)
       * App Start:  0x10010100
       */
-      FLASH : ORIGIN = 0x10000000, LENGTH = 2048K
+      FLASH : ORIGIN = 0x10011000, LENGTH = 1980K
       /*
       * RAM consists of 8 banks, SRAM0-SRAM7, with a striped mapping.
       * This is usually good for performance, as it distributes load on

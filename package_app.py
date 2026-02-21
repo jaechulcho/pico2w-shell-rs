@@ -17,11 +17,11 @@ def package(input_file, output_file):
     print(f"Length: {length} bytes")
     print(f"CRC32:  0x{crc_val:08x}")
 
-    # 3. Create Metadata Header (256 bytes)
-    # [Magic "APPS" (4) | Length (4, LE) | CRC32 (4, LE) | Padding (244)]
+    # 3. Create Metadata Header (4096 bytes)
+    # [Magic "APPS" (4) | Length (4, LE) | CRC32 (4, LE) | Padding (4084)]
     magic = b"APPS"
     header = magic + struct.pack("<II", length, crc_val)
-    header = header.ljust(256, b'\xFF')
+    header = header.ljust(4096, b'\xFF')
 
     # 4. Write final binary
     with open(output_file, 'wb') as f:
