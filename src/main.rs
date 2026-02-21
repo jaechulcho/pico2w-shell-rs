@@ -78,7 +78,8 @@ async fn uart_task(
                         cli::uart_write_all(&mut uart, b"\r\n").await;
                         if idx > 0 {
                             if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
-                                cli::handle_command(line, &mut uart, &mut led, uid_str).await;
+                                cli::handle_command(line, &mut uart, &mut led, uid_str, false)
+                                    .await;
                             }
                             idx = 0;
                         }
@@ -106,7 +107,7 @@ async fn uart_task(
                         cli::uart_write_all(&mut uart, b"\r\n").await;
                         if idx > 0 {
                             if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
-                                cli::handle_command(line, &mut uart, &mut led, uid_str).await;
+                                cli::handle_command(line, &mut uart, &mut led, uid_str, true).await;
                             }
                             idx = 0;
                         }

@@ -1,8 +1,11 @@
+use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_rp::gpio::Output;
 use embassy_rp::uart::{Async, Uart};
 //use embedded_io_async::Write;
 
 use crate::ble;
+
+static BLE_AUTHENTICATED: AtomicBool = AtomicBool::new(false);
 
 pub async fn uart_write_all(uart: &mut Uart<'static, Async>, buf: &[u8]) {
     let _ = uart.write(buf).await;
@@ -215,16 +218,66 @@ impl Command for RebootCommand {
     }
 }
 
+pub struct AuthCommand;
+impl Command for AuthCommand {
+    fn name(&self) -> &str {
+        "auth"
+    }
+    fn description(&self) -> &str {
+        "Authenticate the BLE connection"
+    }
+    async fn exec(
+        &self,
+        uart: &mut Uart<'static, Async>,
+        _led: &mut Output<'static>,
+        args: &[&str],
+        uid_str: &str,
+    ) {
+        if args.is_empty() {
+            uart_write_all(uart, b"Usage: auth <passkey>\r\n").await;
+            return;
+        }
+
+        // Expected passkey is the last 6 characters of the UID (XXXXXX)
+        let passkey = if uid_str.len() >= 6 {
+            &uid_str[uid_str.len() - 6..]
+        } else {
+            uid_str
+        };
+
+        if args[0] == passkey {
+            BLE_AUTHENTICATED.store(true, Ordering::SeqCst);
+            uart_write_all(uart, b"Authentication successful. Shell unlocked.\r\n").await;
+        } else {
+            uart_write_all(uart, b"Authentication failed. Incorrect passkey.\r\n").await;
+        }
+    }
+}
+
 pub async fn handle_command(
     line: &str,
     uart: &mut Uart<'static, Async>,
     led: &mut Output<'static>,
     uid_str: &str,
+    from_ble: bool,
 ) {
     let mut parts = line.split_whitespace();
     if let Some(cmd_name) = parts.next() {
         let args_vec: heapless::Vec<&str, 8> = parts.collect();
         let args = &args_vec;
+
+        // Check if authentication is required
+        if from_ble && !BLE_AUTHENTICATED.load(Ordering::SeqCst) {
+            // Unlocked commands
+            if cmd_name != "auth" && cmd_name != "reboot" {
+                uart_write_all(
+                    uart,
+                    b"Unauthorized. Please run 'auth <passkey>' first.\r\n",
+                )
+                .await;
+                return;
+            }
+        }
 
         match cmd_name {
             "help" => HelpCommand.exec(uart, led, args, uid_str).await,
@@ -232,6 +285,7 @@ pub async fn handle_command(
             "info" => InfoCommand.exec(uart, led, args, uid_str).await,
             "echo" => EchoCommand.exec(uart, led, args, uid_str).await,
             "log" => LogCommand.exec(uart, led, args, uid_str).await,
+            "auth" => AuthCommand.exec(uart, led, args, uid_str).await,
             "reboot" => RebootCommand.exec(uart, led, args, uid_str).await,
             _ => {
                 uart_write_all(uart, b"Unknown command: ").await;
