@@ -5,16 +5,90 @@ use embassy_rp::uart::{Async, Uart};
 
 use crate::ble;
 
+// 모든 커맨트 인스턴스를 모아둔 배열
+pub enum CommandEnum {
+    Help(HelpCommand),
+    Led(LedCommand),
+    Info(InfoCommand),
+    Echo(EchoCommand),
+    Log(LogCommand),
+    Auth(AuthCommand),
+    Reboot(RebootCommand),
+}
+
+impl CommandEnum {
+    // 트레이트 메서드를 대리 호출(Delegate)
+    fn name(&self) -> &str {
+        match self {
+            Self::Help(c) => c.name(),
+            Self::Led(c) => c.name(),
+            Self::Info(c) => c.name(),
+            Self::Echo(c) => c.name(),
+            Self::Log(c) => c.name(),
+            Self::Auth(c) => c.name(),
+            Self::Reboot(c) => c.name(),
+        }
+    }
+
+    fn description(&self) -> &str {
+        match self {
+            Self::Help(c) => c.description(),
+            Self::Led(c) => c.description(),
+            Self::Info(c) => c.description(),
+            Self::Echo(c) => c.description(),
+            Self::Log(c) => c.description(),
+            Self::Auth(c) => c.description(),
+            Self::Reboot(c) => c.description(),
+        }
+    }
+
+    async fn exec(
+        &self,
+        uart: &mut Uart<'static, Async>,
+        led: &mut Output<'static>,
+        args: &[&str],
+        uid_str: &str,
+    ) {
+        match self {
+            Self::Help(c) => c.exec(uart, led, args, uid_str).await,
+            Self::Led(c) => c.exec(uart, led, args, uid_str).await,
+            Self::Info(c) => c.exec(uart, led, args, uid_str).await,
+            Self::Echo(c) => c.exec(uart, led, args, uid_str).await,
+            Self::Log(c) => c.exec(uart, led, args, uid_str).await,
+            Self::Auth(c) => c.exec(uart, led, args, uid_str).await,
+            Self::Reboot(c) => c.exec(uart, led, args, uid_str).await,
+        }
+    }
+}
+
+const COMMANDS: &[CommandEnum] = &[
+    CommandEnum::Help(HelpCommand),
+    CommandEnum::Led(LedCommand),
+    CommandEnum::Info(InfoCommand),
+    CommandEnum::Echo(EchoCommand),
+    CommandEnum::Log(LogCommand),
+    CommandEnum::Auth(AuthCommand),
+    CommandEnum::Reboot(RebootCommand),
+];
+
 static BLE_AUTHENTICATED: AtomicBool = AtomicBool::new(false);
 
 pub async fn uart_write_all(uart: &mut Uart<'static, Async>, buf: &[u8]) {
+    if buf.is_empty() {
+        return;
+    }
     let _ = uart.write(buf).await;
+    let _ = uart.blocking_flush();
     // Also send to BLE TX Channel
     if buf.len() > 0 {
-        let mut vec = heapless::Vec::new();
+        let mut vec: heapless::Vec<u8, 64> = heapless::Vec::new();
         // Break into 64-byte chunks if needed, but for now just send what fits
-        let _ = vec.extend_from_slice(&buf[..core::cmp::min(buf.len(), 64)]);
-        let _ = ble::BLE_TX_CHANNEL.try_send(vec);
+        if vec
+            .extend_from_slice(&buf[..core::cmp::min(buf.len(), 64)])
+            .is_ok()
+        {
+            let _ = ble::BLE_TX_CHANNEL.try_send(vec);
+        }
     }
 }
 
@@ -46,11 +120,22 @@ impl Command for HelpCommand {
         _uid_str: &str,
     ) {
         uart_write_all(uart, b"Available commands:\r\n").await;
-        uart_write_all(uart, b"  help    - Show this help\r\n").await;
-        uart_write_all(uart, b"  led <on|off> - Control the GP28 LED\r\n").await;
-        uart_write_all(uart, b"  info    - Show system info\r\n").await;
-        uart_write_all(uart, b"  echo <msg>    - Echo the message\r\n").await;
-        uart_write_all(uart, b"  reboot  - Reset the system to bootloader\r\n").await;
+
+        for cmd in COMMANDS {
+            // 각 커맨트의 name()과 description()을 재사용
+            uart_write_all(uart, b"  ").await;
+            uart_write_all(uart, cmd.name().as_bytes()).await;
+
+            // 간격을 맞추기 위한 공백 처리 (예, 12칸 정렬)
+            let padding = 12usize.saturating_sub(cmd.name().len());
+            for _ in 0..padding {
+                uart_write_all(uart, b" ").await;
+            }
+
+            uart_write_all(uart, b" - ").await;
+            uart_write_all(uart, cmd.description().as_bytes()).await;
+            uart_write_all(uart, b"\r\n").await;
+        }
     }
 }
 
@@ -262,36 +347,31 @@ pub async fn handle_command(
     from_ble: bool,
 ) {
     let mut parts = line.split_whitespace();
-    if let Some(cmd_name) = parts.next() {
-        let args_vec: heapless::Vec<&str, 8> = parts.collect();
-        let args = &args_vec;
+    let Some(cmd_name) = parts.next() else { return };
+    let args_vec: heapless::Vec<&str, 8> = parts.collect();
+    let args = &args_vec;
 
-        // Check if authentication is required
-        if from_ble && !BLE_AUTHENTICATED.load(Ordering::SeqCst) {
-            // Unlocked commands
-            if cmd_name != "auth" && cmd_name != "reboot" {
-                uart_write_all(
-                    uart,
-                    b"Unauthorized. Please run 'auth <passkey>' first.\r\n",
-                )
-                .await;
-                return;
+    // 1. COMMANDS 배열에서 일치 하는 커맨트 찾기
+    let target = COMMANDS.iter().find(|c| c.name() == cmd_name);
+
+    match target {
+        Some(cmd) => {
+            // 2. 인증 체크 (메서드 활용)
+            if from_ble && !BLE_AUTHENTICATED.load(Ordering::SeqCst) {
+                if cmd_name != AuthCommand.name() && cmd_name != RebootCommand.name() {
+                    uart_write_all(uart, b"Unauthored. Please run 'auth <passkey>' first.\r\n")
+                        .await;
+                    return;
+                }
             }
+            // 3. 실행
+            cmd.exec(uart, led, args, uid_str).await;
         }
-
-        match cmd_name {
-            "help" => HelpCommand.exec(uart, led, args, uid_str).await,
-            "led" => LedCommand.exec(uart, led, args, uid_str).await,
-            "info" => InfoCommand.exec(uart, led, args, uid_str).await,
-            "echo" => EchoCommand.exec(uart, led, args, uid_str).await,
-            "log" => LogCommand.exec(uart, led, args, uid_str).await,
-            "auth" => AuthCommand.exec(uart, led, args, uid_str).await,
-            "reboot" => RebootCommand.exec(uart, led, args, uid_str).await,
-            _ => {
-                uart_write_all(uart, b"Unknown command: ").await;
-                uart_write_all(uart, cmd_name.as_bytes()).await;
-                uart_write_all(uart, b"\r\n").await;
-            }
+        None => {
+            // 4. 알 수 없는 명령어 처리
+            uart_write_all(uart, b"Unknown command: ").await;
+            uart_write_all(uart, cmd_name.as_bytes()).await;
+            uart_write_all(uart, b"\r\n").await;
         }
     }
 }

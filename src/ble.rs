@@ -9,9 +9,9 @@ const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 2;
 
 // Channels for bridging BLE and UART
-pub static BLE_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 64>, 8> =
+pub static BLE_RX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 64>, 128> =
     Channel::new();
-pub static BLE_TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 64>, 8> =
+pub static BLE_TX_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 64>, 128> =
     Channel::new();
 
 #[gatt_server]
