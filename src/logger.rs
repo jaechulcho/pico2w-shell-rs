@@ -180,3 +180,228 @@ pub async fn log_clear() -> Result<(), littlefs2::io::Error> {
     let _ = fs_locked.0.remove(littlefs2::path!("syslog.txt"));
     Ok(())
 }
+
+static CWD: Mutex<CriticalSectionRawMutex, heapless::String<256>> =
+    Mutex::new(heapless::String::new());
+
+pub async fn pwd() -> heapless::String<256> {
+    let mut guard = CWD.lock().await;
+    if guard.is_empty() {
+        guard.push_str("/").unwrap();
+    }
+    guard.clone()
+}
+
+fn resolve_path_str(cwd: &str, path: &str) -> heapless::String<256> {
+    let mut result = heapless::String::<256>::new();
+
+    let full_path = if path.starts_with('/') {
+        let mut s = heapless::String::<256>::new();
+        s.push_str(path).unwrap_or_default();
+        s
+    } else {
+        let mut s = heapless::String::<256>::new();
+        s.push_str(cwd).unwrap_or_default();
+        if !s.ends_with('/') {
+            s.push('/').unwrap_or_default();
+        }
+        s.push_str(path).unwrap_or_default();
+        s
+    };
+
+    let mut parts = heapless::Vec::<&str, 32>::new();
+
+    for part in full_path.split('/') {
+        if part == "" || part == "." {
+            continue;
+        } else if part == ".." {
+            let _ = parts.pop();
+        } else {
+            let _ = parts.push(part);
+        }
+    }
+
+    result.push('/').unwrap_or_default();
+    for (i, part) in parts.iter().enumerate() {
+        result.push_str(part).unwrap_or_default();
+        if i < parts.len() - 1 {
+            result.push('/').unwrap_or_default();
+        }
+    }
+
+    if result.len() > 1 && result.ends_with('/') {
+        result.pop();
+    }
+
+    result
+}
+
+fn to_lfs_path(p: &str) -> littlefs2::path::PathBuf {
+    let p = if p.starts_with('/') && p.len() > 1 {
+        &p[1..]
+    } else {
+        p
+    };
+    littlefs2::path::PathBuf::try_from(p)
+        .unwrap_or_else(|_| littlefs2::path::PathBuf::try_from("/").unwrap())
+}
+
+pub async fn fs_mkdir(path: &str) -> Result<(), ()> {
+    let cwd_str = pwd().await;
+    let resolved = resolve_path_str(cwd_str.as_str(), path);
+    let lfs_path = to_lfs_path(&resolved);
+
+    let mut fs_guard = FS.lock().await;
+    let fs_locked = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return Err(()),
+    };
+
+    fs_locked.0.create_dir(&lfs_path).map_err(|_| ())?;
+    Ok(())
+}
+
+pub async fn fs_cd(path: &str) -> Result<(), ()> {
+    let cwd_str = pwd().await;
+    let resolved = resolve_path_str(cwd_str.as_str(), path);
+
+    let mut fs_guard = FS.lock().await;
+    let fs_locked = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return Err(()),
+    };
+
+    if resolved.as_str() != "/" {
+        let lfs_path = to_lfs_path(&resolved);
+        let meta = fs_locked.0.metadata(&lfs_path).map_err(|_| ())?;
+        if !meta.is_dir() {
+            return Err(());
+        }
+    }
+
+    let mut guard = CWD.lock().await;
+    guard.clear();
+    guard.push_str(&resolved).unwrap();
+    Ok(())
+}
+
+pub struct DirEntryInfo {
+    pub name: heapless::String<64>,
+    pub is_dir: bool,
+    pub size: usize,
+}
+
+pub async fn fs_ls(
+    uart: &mut embassy_rp::uart::Uart<'static, embassy_rp::uart::Async>,
+    path: Option<&str>,
+) -> Result<(), ()> {
+    let cwd_str = pwd().await;
+    let target_path = path.unwrap_or(cwd_str.as_str());
+    let resolved = resolve_path_str(cwd_str.as_str(), target_path);
+    let lfs_path = to_lfs_path(&resolved);
+
+    let mut fs_guard = FS.lock().await;
+    let fs_locked = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return Err(()),
+    };
+
+    let mut buf = heapless::String::<128>::new();
+    core::write!(&mut buf, "Directory of {}:\r\n", resolved.as_str()).ok();
+    crate::cli::uart_write_all(uart, buf.as_bytes()).await;
+
+    let mut entries = heapless::Vec::<DirEntryInfo, 32>::new();
+    let _ = fs_locked.0.read_dir_and_then(&lfs_path, |dir| {
+        for entry_res in dir {
+            if let Ok(entry) = entry_res {
+                let name = entry.file_name();
+                let is_dir = entry.file_type().is_dir();
+                // To avoid borrowing issues, entry size is omitted or retrieved via custom struct if needed?
+                // littlefs2 DirEntry might not have `metadata()` or `len()`. Let's just retrieve file_type and file_name.
+                // It does have `metadata()`.
+                let size = entry.metadata().len();
+
+                let mut name_str = heapless::String::<64>::new();
+                name_str.push_str(name.as_ref()).unwrap_or_default();
+
+                let _ = entries.push(DirEntryInfo {
+                    name: name_str,
+                    is_dir,
+                    size,
+                });
+            }
+        }
+        Ok(())
+    });
+
+    for entry in entries {
+        let mut line = heapless::String::<128>::new();
+        if entry.is_dir {
+            core::write!(&mut line, "[DIR]  {}\r\n", entry.name).ok();
+        } else {
+            core::write!(
+                &mut line,
+                "[FILE] {} ({} bytes)\r\n",
+                entry.name,
+                entry.size
+            )
+            .ok();
+        }
+        crate::cli::uart_write_all(uart, line.as_bytes()).await;
+    }
+    Ok(())
+}
+
+pub async fn fs_cat(
+    uart: &mut embassy_rp::uart::Uart<'static, embassy_rp::uart::Async>,
+    path: &str,
+) -> Result<(), ()> {
+    let cwd_str = pwd().await;
+    let resolved = resolve_path_str(cwd_str.as_str(), path);
+    let lfs_path = to_lfs_path(&resolved);
+
+    let mut fs_guard = FS.lock().await;
+    let fs_locked = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return Err(()),
+    };
+
+    let meta = fs_locked.0.metadata(&lfs_path).map_err(|_| ())?;
+    if meta.is_dir() {
+        let mut buf = heapless::String::<64>::new();
+        core::write!(&mut buf, "error: {} is a directory\r\n", path).ok();
+        crate::cli::uart_write_all(uart, buf.as_bytes()).await;
+        return Err(());
+    }
+
+    let mut offset = 0;
+    let mut buf = [0u8; 128];
+    loop {
+        let mut bytes_read = 0;
+        let res = fs_locked.0.open_file_with_options_and_then(
+            |o| o.read(true),
+            &lfs_path,
+            |file| {
+                file.seek(littlefs2::io::SeekFrom::Start(offset as u32))?;
+                bytes_read = file.read(&mut buf)?;
+                Ok(())
+            },
+        );
+
+        if res.is_err() {
+            let mut buf_str = heapless::String::<64>::new();
+            core::write!(&mut buf_str, "error: could not read file\r\n").ok();
+            crate::cli::uart_write_all(uart, buf_str.as_bytes()).await;
+            return Err(());
+        }
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        offset += bytes_read;
+        crate::cli::uart_write_all(uart, &buf[..bytes_read]).await;
+    }
+    crate::cli::uart_write_all(uart, b"\r\n").await;
+    Ok(())
+}

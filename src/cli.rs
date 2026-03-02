@@ -14,6 +14,10 @@ pub enum CommandEnum {
     Log(LogCommand),
     Auth(AuthCommand),
     Reboot(RebootCommand),
+    Mkdir(MkdirCommand),
+    Cd(CdCommand),
+    Ls(LsCommand),
+    Cat(CatCommand),
 }
 
 impl CommandEnum {
@@ -27,6 +31,10 @@ impl CommandEnum {
             Self::Log(c) => c.name(),
             Self::Auth(c) => c.name(),
             Self::Reboot(c) => c.name(),
+            Self::Mkdir(c) => c.name(),
+            Self::Cd(c) => c.name(),
+            Self::Ls(c) => c.name(),
+            Self::Cat(c) => c.name(),
         }
     }
 
@@ -39,6 +47,10 @@ impl CommandEnum {
             Self::Log(c) => c.description(),
             Self::Auth(c) => c.description(),
             Self::Reboot(c) => c.description(),
+            Self::Mkdir(c) => c.description(),
+            Self::Cd(c) => c.description(),
+            Self::Ls(c) => c.description(),
+            Self::Cat(c) => c.description(),
         }
     }
 
@@ -57,6 +69,10 @@ impl CommandEnum {
             Self::Log(c) => c.exec(uart, led, args, uid_str).await,
             Self::Auth(c) => c.exec(uart, led, args, uid_str).await,
             Self::Reboot(c) => c.exec(uart, led, args, uid_str).await,
+            Self::Mkdir(c) => c.exec(uart, led, args, uid_str).await,
+            Self::Cd(c) => c.exec(uart, led, args, uid_str).await,
+            Self::Ls(c) => c.exec(uart, led, args, uid_str).await,
+            Self::Cat(c) => c.exec(uart, led, args, uid_str).await,
         }
     }
 }
@@ -69,6 +85,10 @@ const COMMANDS: &[CommandEnum] = &[
     CommandEnum::Log(LogCommand),
     CommandEnum::Auth(AuthCommand),
     CommandEnum::Reboot(RebootCommand),
+    CommandEnum::Mkdir(MkdirCommand),
+    CommandEnum::Cd(CdCommand),
+    CommandEnum::Ls(LsCommand),
+    CommandEnum::Cat(CatCommand),
 ];
 
 static BLE_AUTHENTICATED: AtomicBool = AtomicBool::new(false);
@@ -361,6 +381,103 @@ impl Command for AuthCommand {
         } else {
             uart_write_all(uart, b"Authentication failed. Incorrect passkey.\r\n").await;
         }
+    }
+}
+
+pub struct MkdirCommand;
+impl Command for MkdirCommand {
+    fn name(&self) -> &str {
+        "mkdir"
+    }
+    fn description(&self) -> &str {
+        "Create a directory in the filesystem"
+    }
+    async fn exec(
+        &self,
+        uart: &mut Uart<'static, Async>,
+        _led: &mut Output<'static>,
+        args: &[&str],
+        _uid_str: &str,
+    ) {
+        if args.is_empty() {
+            uart_write_all(uart, b"Usage: mkdir <path>\r\n").await;
+            return;
+        }
+        if crate::logger::fs_mkdir(args[0]).await.is_err() {
+            uart_write_all(uart, b"error: failed to create directory\r\n").await;
+        } else {
+            uart_write_all(uart, b"OK\r\n").await;
+        }
+    }
+}
+
+pub struct CdCommand;
+impl Command for CdCommand {
+    fn name(&self) -> &str {
+        "cd"
+    }
+    fn description(&self) -> &str {
+        "Change the current working directory"
+    }
+    async fn exec(
+        &self,
+        uart: &mut Uart<'static, Async>,
+        _led: &mut Output<'static>,
+        args: &[&str],
+        _uid_str: &str,
+    ) {
+        if args.is_empty() {
+            uart_write_all(uart, b"Usage: cd <path>\r\n").await;
+            return;
+        }
+        if crate::logger::fs_cd(args[0]).await.is_err() {
+            uart_write_all(uart, b"error: no such file or directory\r\n").await;
+        }
+    }
+}
+
+pub struct LsCommand;
+impl Command for LsCommand {
+    fn name(&self) -> &str {
+        "ls"
+    }
+    fn description(&self) -> &str {
+        "List directory contents"
+    }
+    async fn exec(
+        &self,
+        uart: &mut Uart<'static, Async>,
+        _led: &mut Output<'static>,
+        args: &[&str],
+        _uid_str: &str,
+    ) {
+        let path = if args.is_empty() { None } else { Some(args[0]) };
+        if crate::logger::fs_ls(uart, path).await.is_err() {
+            uart_write_all(uart, b"error: failed to list directory\r\n").await;
+        }
+    }
+}
+
+pub struct CatCommand;
+impl Command for CatCommand {
+    fn name(&self) -> &str {
+        "cat"
+    }
+    fn description(&self) -> &str {
+        "Read file content and stream to terminal"
+    }
+    async fn exec(
+        &self,
+        uart: &mut Uart<'static, Async>,
+        _led: &mut Output<'static>,
+        args: &[&str],
+        _uid_str: &str,
+    ) {
+        if args.is_empty() {
+            uart_write_all(uart, b"Usage: cat <path>\r\n").await;
+            return;
+        }
+        let _ = crate::logger::fs_cat(uart, args[0]).await;
     }
 }
 
