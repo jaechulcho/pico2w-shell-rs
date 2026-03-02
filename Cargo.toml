@@ -31,6 +31,7 @@ trouble-host = { git = "https://github.com/embassy-rs/trouble.git", features = [
 cyw43-pio = { git = "https://github.com/embassy-rs/embassy.git" }
 embedded-io-async = "0.7.0"
 assign-resources = "0.4.1"
+littlefs2 = "0.6.1"
 
 [target.'cfg( target_arch = "arm" )'.dependencies]
 panic-probe = { version = "1", features = ["print-defmt"] }

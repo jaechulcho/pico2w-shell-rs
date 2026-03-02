@@ -230,7 +230,7 @@ impl Command for LogCommand {
         "log"
     }
     fn description(&self) -> &str {
-        "Set log level (error, warn, info, debug, trace)"
+        "Manage logs (print, clear, record) and level (error, warn, info, debug, trace)"
     }
     async fn exec(
         &self,
@@ -259,6 +259,31 @@ impl Command for LogCommand {
         }
 
         let new_level = match args[0] {
+            "print" => {
+                let _ = crate::logger::log_print(uart).await;
+                return;
+            }
+            "clear" => {
+                let _ = crate::logger::log_clear().await;
+                let _ = uart_write_all(uart, b"Log cleared.\r\n").await;
+                return;
+            }
+            "record" => {
+                if args.len() > 1 {
+                    let mut msg: heapless::String<256> = heapless::String::new();
+                    for (i, arg) in args[1..].iter().enumerate() {
+                        if i > 0 {
+                            let _ = msg.push_str(" ");
+                        }
+                        let _ = msg.push_str(arg);
+                    }
+                    let _ = crate::logger::write_log(msg.as_str()).await;
+                    let _ = uart_write_all(uart, b"Log recorded.\r\n").await;
+                } else {
+                    let _ = uart_write_all(uart, b"Usage: log record <message>\r\n").await;
+                }
+                return;
+            }
             "error" => 0,
             "warn" => 1,
             "info" => 2,
@@ -267,7 +292,7 @@ impl Command for LogCommand {
             _ => {
                 let _ = uart_write_all(
                     uart,
-                    b"Invalid level. Use: error, warn, info, debug, trace\r\n",
+                    b"Invalid use. Subcommands: print, clear, record. Levels: error, warn, info, debug, trace\r\n",
                 )
                 .await;
                 return;

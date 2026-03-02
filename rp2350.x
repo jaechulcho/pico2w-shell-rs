@@ -11,7 +11,7 @@ MEMORY {
       * Shifted for Bootloader:
       * Bootloader: 0x10000000 (64K)
       * Metadata:   0x10010000 (256B)
-      * App Start:  0x10010100
+      * App Start:  0x10011000
       */
       FLASH : ORIGIN = 0x10011000, LENGTH = 1980K
       /*

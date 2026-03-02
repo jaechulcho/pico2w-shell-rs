@@ -7,6 +7,7 @@
 mod ble;
 mod cli;
 mod log_filter;
+mod logger;
 
 use cyw43_pio::PioSpi;
 use defmt::*;
@@ -182,6 +183,17 @@ async fn main(spawner: Spawner) {
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
     let mut pio = Pio::new(p.PIO0, Irqs);
+
+    // Initialize Flash for logger
+    let flash = embassy_rp::flash::Flash::new(p.FLASH, p.DMA_CH2, Irqs);
+
+    if let Err(_e) = logger::init(flash) {
+        defmt::error!("Logger init failed!");
+    } else {
+        defmt::info!("Logger initialized successfully.");
+        // Test log
+        let _ = embassy_futures::block_on(logger::log_write_all(b"System booted."));
+    }
 
     let spi = PioSpi::new(
         &mut pio.common,
