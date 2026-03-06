@@ -26,12 +26,12 @@ embassy-rp = { git = "https://github.com/embassy-rs/embassy.git", features = ["d
 embassy-usb = { git = "https://github.com/embassy-rs/embassy.git" }
 embassy-sync = { git = "https://github.com/embassy-rs/embassy.git" }
 embassy-net = { git = "https://github.com/embassy-rs/embassy.git", features = ["defmt", "tcp", "udp", "dhcpv4"] }
-cyw43 = { git = "https://github.com/embassy-rs/embassy.git", features = ["defmt", "firmware-logs", "bluetooth"] }
-trouble-host = { git = "https://github.com/embassy-rs/trouble.git", features = ["defmt"] }
+cyw43 = { git = "https://github.com/embassy-rs/embassy.git", features = ["defmt", "firmware-logs"] }
 cyw43-pio = { git = "https://github.com/embassy-rs/embassy.git" }
 embedded-io-async = "0.7.0"
 assign-resources = "0.4.1"
 littlefs2 = "0.6.1"
+edge-dhcp = "0.7.0"
 
 [target.'cfg( target_arch = "arm" )'.dependencies]
 panic-probe = { version = "1", features = ["print-defmt"] }

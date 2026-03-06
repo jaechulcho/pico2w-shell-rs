@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use core::fmt::Write as _;
-use defmt::{error, info, warn};
+
 use embassy_rp::flash::{Async, Flash};
 use embassy_rp::peripherals::FLASH;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -96,12 +96,12 @@ pub async fn log_write_all(message: &[u8]) -> Result<(), littlefs2::io::Error> {
     let path = littlefs2::path!("syslog.txt");
 
     // Check size
-    if let Ok(meta) = fs_locked.0.metadata(path) {
-        if meta.len() > MAX_LOG_SIZE {
-            let old_path = littlefs2::path!("syslog.0.txt");
-            let _ = fs_locked.0.remove(old_path);
-            let _ = fs_locked.0.rename(path, old_path);
-        }
+    if let Ok(meta) = fs_locked.0.metadata(path)
+        && meta.len() > MAX_LOG_SIZE
+    {
+        let old_path = littlefs2::path!("syslog.0.txt");
+        let _ = fs_locked.0.remove(old_path);
+        let _ = fs_locked.0.rename(path, old_path);
     }
 
     // Append to log
@@ -127,7 +127,7 @@ pub async fn write_log(msg: &str) -> Result<(), littlefs2::io::Error> {
 }
 
 pub async fn log_print(
-    uart: &mut embassy_rp::uart::UartTx<'static, embassy_rp::uart::Async>,
+    uart: &mut embassy_rp::uart::UartTx<'static, embassy_rp::uart::Blocking>,
 ) -> Result<(), littlefs2::io::Error> {
     let mut fs_guard = FS.lock().await;
     let fs_locked = match fs_guard.as_mut() {
@@ -141,14 +141,14 @@ pub async fn log_print(
     ];
 
     for path in &paths {
-        if let Ok(_) = fs_locked.0.metadata(*path) {
+        if fs_locked.0.metadata(path).is_ok() {
             let mut offset = 0;
             let mut buf = [0u8; 128];
             loop {
                 let mut bytes_read = 0;
                 let _ = fs_locked.0.open_file_with_options_and_then(
                     |o| o.read(true),
-                    *path,
+                    path,
                     |file| {
                         file.seek(littlefs2::io::SeekFrom::Start(offset as u32))?;
                         bytes_read = file.read(&mut buf)?;
@@ -212,7 +212,7 @@ fn resolve_path_str(cwd: &str, path: &str) -> heapless::String<256> {
     let mut parts = heapless::Vec::<&str, 32>::new();
 
     for part in full_path.split('/') {
-        if part == "" || part == "." {
+        if part.is_empty() || part == "." {
             continue;
         } else if part == ".." {
             let _ = parts.pop();
@@ -292,7 +292,7 @@ pub struct DirEntryInfo {
 }
 
 pub async fn fs_ls(
-    uart: &mut embassy_rp::uart::UartTx<'static, embassy_rp::uart::Async>,
+    uart: &mut embassy_rp::uart::UartTx<'static, embassy_rp::uart::Blocking>,
     path: Option<&str>,
 ) -> Result<(), ()> {
     let cwd_str = pwd().await;
@@ -312,24 +312,22 @@ pub async fn fs_ls(
 
     let mut entries = heapless::Vec::<DirEntryInfo, 32>::new();
     let _ = fs_locked.0.read_dir_and_then(&lfs_path, |dir| {
-        for entry_res in dir {
-            if let Ok(entry) = entry_res {
-                let name = entry.file_name();
-                let is_dir = entry.file_type().is_dir();
-                // To avoid borrowing issues, entry size is omitted or retrieved via custom struct if needed?
-                // littlefs2 DirEntry might not have `metadata()` or `len()`. Let's just retrieve file_type and file_name.
-                // It does have `metadata()`.
-                let size = entry.metadata().len();
+        for entry in dir.flatten() {
+            let name = entry.file_name();
+            let is_dir = entry.file_type().is_dir();
+            // To avoid borrowing issues, entry size is omitted or retrieved via custom struct if needed?
+            // littlefs2 DirEntry might not have `metadata()` or `len()`. Let's just retrieve file_type and file_name.
+            // It does have `metadata()`.
+            let size = entry.metadata().len();
 
-                let mut name_str = heapless::String::<64>::new();
-                name_str.push_str(name.as_ref()).unwrap_or_default();
+            let mut name_str = heapless::String::<64>::new();
+            name_str.push_str(name.as_ref()).unwrap_or_default();
 
-                let _ = entries.push(DirEntryInfo {
-                    name: name_str,
-                    is_dir,
-                    size,
-                });
-            }
+            let _ = entries.push(DirEntryInfo {
+                name: name_str,
+                is_dir,
+                size,
+            });
         }
         Ok(())
     });
@@ -353,7 +351,7 @@ pub async fn fs_ls(
 }
 
 pub async fn fs_cat(
-    uart: &mut embassy_rp::uart::UartTx<'static, embassy_rp::uart::Async>,
+    uart: &mut embassy_rp::uart::UartTx<'static, embassy_rp::uart::Blocking>,
     path: &str,
 ) -> Result<(), ()> {
     let cwd_str = pwd().await;

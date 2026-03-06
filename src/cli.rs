@@ -1,9 +1,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_rp::gpio::Output;
-use embassy_rp::uart::{Async, UartTx};
+use embassy_rp::uart::{Blocking, UartTx};
 //use embedded_io_async::Write;
-
-use crate::ble;
 
 // 모든 커맨트 인스턴스를 모아둔 배열
 pub enum CommandEnum {
@@ -56,7 +54,7 @@ impl CommandEnum {
 
     async fn exec(
         &self,
-        uart: &mut UartTx<'static, Async>,
+        uart: &mut UartTx<'static, Blocking>,
         led: &mut Output<'static>,
         args: &[&str],
         uid_str: &str,
@@ -91,21 +89,21 @@ const COMMANDS: &[CommandEnum] = &[
     CommandEnum::Cat(CatCommand),
 ];
 
-static BLE_AUTHENTICATED: AtomicBool = AtomicBool::new(false);
+static TCP_AUTHENTICATED: AtomicBool = AtomicBool::new(false);
 
-pub async fn uart_write_all(uart: &mut UartTx<'static, Async>, buf: &[u8]) {
+pub async fn uart_write_all(uart: &mut UartTx<'static, Blocking>, buf: &[u8]) {
     if buf.is_empty() {
         return;
     }
-    let _ = uart.write(buf).await;
+    let _ = uart.blocking_write(buf);
     // Removed `uart.blocking_flush()` to avoid busy-waiting and blocking other async tasks.
 
-    // Also send to BLE TX Channel
+    // Also send to TCP TX Channel
     if !buf.is_empty() {
         for chunk in buf.chunks(64) {
             let mut vec: heapless::Vec<u8, 64> = heapless::Vec::new();
             if vec.extend_from_slice(chunk).is_ok() {
-                let _ = ble::BLE_TX_CHANNEL.try_send(vec);
+                let _ = crate::TCP_TX_CHANNEL.try_send(vec);
             }
         }
     }
@@ -116,7 +114,7 @@ pub trait Command {
     fn description(&self) -> &str;
     async fn exec(
         &self,
-        uart: &mut UartTx<'static, Async>,
+        uart: &mut UartTx<'static, Blocking>,
         led: &mut Output<'static>,
         args: &[&str],
         uid_str: &str,
@@ -133,7 +131,7 @@ impl Command for HelpCommand {
     }
     async fn exec(
         &self,
-        uart: &mut UartTx<'static, Async>,
+        uart: &mut UartTx<'static, Blocking>,
         _led: &mut Output<'static>,
         _args: &[&str],
         _uid_str: &str,
@@ -168,7 +166,7 @@ impl Command for LedCommand {
     }
     async fn exec(
         &self,
-        uart: &mut UartTx<'static, Async>,
+        uart: &mut UartTx<'static, Blocking>,
         led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
@@ -204,7 +202,7 @@ impl Command for InfoCommand {
     }
     async fn exec(
         &self,
-        uart: &mut UartTx<'static, Async>,
+        uart: &mut UartTx<'static, Blocking>,
         _led: &mut Output<'static>,
         _args: &[&str],
         uid_str: &str,
@@ -228,7 +226,7 @@ impl Command for EchoCommand {
     }
     async fn exec(
         &self,
-        uart: &mut UartTx<'static, Async>,
+        uart: &mut UartTx<'static, Blocking>,
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
@@ -253,7 +251,7 @@ impl Command for LogCommand {
     }
     async fn exec(
         &self,
-        uart: &mut UartTx<'static, Async>,
+        uart: &mut UartTx<'static, Blocking>,
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
@@ -335,7 +333,7 @@ impl Command for RebootCommand {
     }
     async fn exec(
         &self,
-        uart: &mut UartTx<'static, Async>,
+        uart: &mut UartTx<'static, Blocking>,
         _led: &mut Output<'static>,
         _args: &[&str],
         _uid_str: &str,
@@ -357,7 +355,7 @@ impl Command for AuthCommand {
     }
     async fn exec(
         &self,
-        uart: &mut UartTx<'static, Async>,
+        uart: &mut UartTx<'static, Blocking>,
         _led: &mut Output<'static>,
         args: &[&str],
         uid_str: &str,
@@ -375,7 +373,7 @@ impl Command for AuthCommand {
         };
 
         if args[0] == passkey {
-            BLE_AUTHENTICATED.store(true, Ordering::SeqCst);
+            TCP_AUTHENTICATED.store(true, Ordering::SeqCst);
             uart_write_all(uart, b"Authentication successful. Shell unlocked.\r\n").await;
         } else {
             uart_write_all(uart, b"Authentication failed. Incorrect passkey.\r\n").await;
@@ -393,7 +391,7 @@ impl Command for MkdirCommand {
     }
     async fn exec(
         &self,
-        uart: &mut UartTx<'static, Async>,
+        uart: &mut UartTx<'static, Blocking>,
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
@@ -420,7 +418,7 @@ impl Command for CdCommand {
     }
     async fn exec(
         &self,
-        uart: &mut UartTx<'static, Async>,
+        uart: &mut UartTx<'static, Blocking>,
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
@@ -445,7 +443,7 @@ impl Command for LsCommand {
     }
     async fn exec(
         &self,
-        uart: &mut UartTx<'static, Async>,
+        uart: &mut UartTx<'static, Blocking>,
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
@@ -467,7 +465,7 @@ impl Command for CatCommand {
     }
     async fn exec(
         &self,
-        uart: &mut UartTx<'static, Async>,
+        uart: &mut UartTx<'static, Blocking>,
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
@@ -482,10 +480,10 @@ impl Command for CatCommand {
 
 pub async fn handle_command(
     line: &str,
-    uart: &mut UartTx<'static, Async>,
+    uart: &mut UartTx<'static, Blocking>,
     led: &mut Output<'static>,
     uid_str: &str,
-    from_ble: bool,
+    from_tcp: bool,
 ) {
     let mut parts = line.split_whitespace();
     let Some(cmd_name) = parts.next() else { return };
@@ -498,13 +496,12 @@ pub async fn handle_command(
     match target {
         Some(cmd) => {
             // 2. 인증 체크 (메서드 활용)
-            if from_ble && !BLE_AUTHENTICATED.load(Ordering::SeqCst) {
-                if cmd_name != AuthCommand.name() && cmd_name != RebootCommand.name() {
+            if from_tcp && !TCP_AUTHENTICATED.load(Ordering::SeqCst)
+                && cmd_name != AuthCommand.name() && cmd_name != RebootCommand.name() {
                     uart_write_all(uart, b"Unauthored. Please run 'auth <passkey>' first.\r\n")
                         .await;
                     return;
                 }
-            }
             // 3. 실행
             cmd.exec(uart, led, args, uid_str).await;
         }
