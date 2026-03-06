@@ -47,86 +47,100 @@ async fn blink_task(mut control: cyw43::Control<'static>) {
     }
 }
 
+pub static UART_RX_CHANNEL: embassy_sync::channel::Channel<
+    embassy_sync::blocking_mutex::raw::ThreadModeRawMutex,
+    u8,
+    64,
+> = embassy_sync::channel::Channel::new();
+
 /// Task to handle UART CLI
 #[embassy_executor::task]
-async fn uart_task(
-    mut uart: Uart<'static, Async>,
-    mut led: Output<'static>,
-    uid_str: &'static str,
-) {
+async fn uart_task(uart: Uart<'static, Async>, mut led: Output<'static>, uid_str: &'static str) {
+    let (mut tx, mut rx) = uart.split();
     let mut buf = [0u8; 64];
     let mut idx = 0;
 
     cli::uart_write_all(
-        &mut uart,
+        &mut tx,
         b"\r\nPico 2W Shell (Embassy with BLE)\r\nType 'help' for commands.\r\n> ",
     )
     .await;
 
-    loop {
-        let mut byte = [0u8; 1];
+    let uart_rx_fut = async {
+        loop {
+            let mut byte = [0u8; 1];
+            if let Ok(_) = rx.read(&mut byte).await {
+                UART_RX_CHANNEL.send(byte[0]).await;
+            } else {
+                // If a read error occurs (e.g. Overrun or Framing), we MUST NOT use defmt blockingly
+                // because it can fill up the RTT buffer and freeze the entire system if no debugger is attached.
+                // We'll just gracefully ignore the error and wait a tiny bit.
+                embassy_time::Timer::after(embassy_time::Duration::from_millis(5)).await;
+            }
+        }
+    };
 
-        // Select between UART read and BLE RX Channel
-        let c_opt =
-            embassy_futures::select::select(uart.read(&mut byte), ble::BLE_RX_CHANNEL.receive())
-                .await;
+    let main_loop_fut = async {
+        loop {
+            // Select between UART read and BLE RX Channel
+            let c_opt = embassy_futures::select::select(
+                UART_RX_CHANNEL.receive(),
+                ble::BLE_RX_CHANNEL.receive(),
+            )
+            .await;
 
-        match c_opt {
-            embassy_futures::select::Either::First(result) => match result {
-                Ok(_) => {
-                    let c = byte[0];
+            match c_opt {
+                embassy_futures::select::Either::First(c) => {
                     if c == b'\r' || c == b'\n' {
-                        cli::uart_write_all(&mut uart, b"\r\n").await;
+                        cli::uart_write_all(&mut tx, b"\r\n").await;
                         if idx > 0 {
                             if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
-                                cli::handle_command(line, &mut uart, &mut led, uid_str, false)
-                                    .await;
+                                cli::handle_command(line, &mut tx, &mut led, uid_str, false).await;
                             }
                             idx = 0;
                         }
-                        cli::uart_write_all(&mut uart, b"> ").await;
+                        cli::uart_write_all(&mut tx, b"> ").await;
                     } else if c == 0x08 || c == 0x7F {
                         if idx > 0 {
                             idx -= 1;
-                            cli::uart_write_all(&mut uart, b"\x08 \x08").await;
+                            cli::uart_write_all(&mut tx, b"\x08 \x08").await;
                         }
                     } else if idx < buf.len() {
-                        cli::uart_write_all(&mut uart, &[c]).await;
+                        cli::uart_write_all(&mut tx, &[c]).await;
                         buf[idx] = c;
                         idx += 1;
                     }
                 }
-                Err(e) => {
-                    defmt::error!("UART Read Error: {:?}", defmt::Debug2Format(&e));
-                    embassy_time::Timer::after(embassy_time::Duration::from_millis(10)).await;
-                }
-            },
-            embassy_futures::select::Either::Second(ble_data) => {
-                // Command received from BLE, process it line by line
-                for &c in ble_data.iter() {
-                    if c == b'\r' || c == b'\n' {
-                        cli::uart_write_all(&mut uart, b"\r\n").await;
-                        if idx > 0 {
-                            if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
-                                cli::handle_command(line, &mut uart, &mut led, uid_str, true).await;
+                embassy_futures::select::Either::Second(ble_data) => {
+                    // Command received from BLE, process it line by line
+                    for &c in ble_data.iter() {
+                        if c == b'\r' || c == b'\n' {
+                            cli::uart_write_all(&mut tx, b"\r\n").await;
+                            if idx > 0 {
+                                if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
+                                    cli::handle_command(line, &mut tx, &mut led, uid_str, true)
+                                        .await;
+                                }
+                                idx = 0;
                             }
-                            idx = 0;
+                            cli::uart_write_all(&mut tx, b"> ").await;
+                        } else if c == 0x08 || c == 0x7F {
+                            if idx > 0 {
+                                idx -= 1;
+                                cli::uart_write_all(&mut tx, b"\x08 \x08").await;
+                            }
+                        } else if idx < buf.len() {
+                            cli::uart_write_all(&mut tx, &[c]).await;
+                            buf[idx] = c;
+                            idx += 1;
                         }
-                        cli::uart_write_all(&mut uart, b"> ").await;
-                    } else if c == 0x08 || c == 0x7F {
-                        if idx > 0 {
-                            idx -= 1;
-                            cli::uart_write_all(&mut uart, b"\x08 \x08").await;
-                        }
-                    } else if idx < buf.len() {
-                        cli::uart_write_all(&mut uart, &[c]).await;
-                        buf[idx] = c;
-                        idx += 1;
                     }
                 }
             }
         }
-    }
+    };
+
+    embassy_futures::join::join(uart_rx_fut, main_loop_fut).await;
 }
 
 type MyCywBus = cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>;

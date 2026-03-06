@@ -1,6 +1,6 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use embassy_rp::gpio::Output;
-use embassy_rp::uart::{Async, Uart};
+use embassy_rp::uart::{Async, UartTx};
 //use embedded_io_async::Write;
 
 use crate::ble;
@@ -56,7 +56,7 @@ impl CommandEnum {
 
     async fn exec(
         &self,
-        uart: &mut Uart<'static, Async>,
+        uart: &mut UartTx<'static, Async>,
         led: &mut Output<'static>,
         args: &[&str],
         uid_str: &str,
@@ -93,21 +93,20 @@ const COMMANDS: &[CommandEnum] = &[
 
 static BLE_AUTHENTICATED: AtomicBool = AtomicBool::new(false);
 
-pub async fn uart_write_all(uart: &mut Uart<'static, Async>, buf: &[u8]) {
+pub async fn uart_write_all(uart: &mut UartTx<'static, Async>, buf: &[u8]) {
     if buf.is_empty() {
         return;
     }
     let _ = uart.write(buf).await;
-    let _ = uart.blocking_flush();
+    // Removed `uart.blocking_flush()` to avoid busy-waiting and blocking other async tasks.
+
     // Also send to BLE TX Channel
-    if buf.len() > 0 {
-        let mut vec: heapless::Vec<u8, 64> = heapless::Vec::new();
-        // Break into 64-byte chunks if needed, but for now just send what fits
-        if vec
-            .extend_from_slice(&buf[..core::cmp::min(buf.len(), 64)])
-            .is_ok()
-        {
-            let _ = ble::BLE_TX_CHANNEL.try_send(vec);
+    if !buf.is_empty() {
+        for chunk in buf.chunks(64) {
+            let mut vec: heapless::Vec<u8, 64> = heapless::Vec::new();
+            if vec.extend_from_slice(chunk).is_ok() {
+                let _ = ble::BLE_TX_CHANNEL.try_send(vec);
+            }
         }
     }
 }
@@ -117,7 +116,7 @@ pub trait Command {
     fn description(&self) -> &str;
     async fn exec(
         &self,
-        uart: &mut Uart<'static, Async>,
+        uart: &mut UartTx<'static, Async>,
         led: &mut Output<'static>,
         args: &[&str],
         uid_str: &str,
@@ -134,7 +133,7 @@ impl Command for HelpCommand {
     }
     async fn exec(
         &self,
-        uart: &mut Uart<'static, Async>,
+        uart: &mut UartTx<'static, Async>,
         _led: &mut Output<'static>,
         _args: &[&str],
         _uid_str: &str,
@@ -169,7 +168,7 @@ impl Command for LedCommand {
     }
     async fn exec(
         &self,
-        uart: &mut Uart<'static, Async>,
+        uart: &mut UartTx<'static, Async>,
         led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
@@ -205,7 +204,7 @@ impl Command for InfoCommand {
     }
     async fn exec(
         &self,
-        uart: &mut Uart<'static, Async>,
+        uart: &mut UartTx<'static, Async>,
         _led: &mut Output<'static>,
         _args: &[&str],
         uid_str: &str,
@@ -229,7 +228,7 @@ impl Command for EchoCommand {
     }
     async fn exec(
         &self,
-        uart: &mut Uart<'static, Async>,
+        uart: &mut UartTx<'static, Async>,
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
@@ -254,7 +253,7 @@ impl Command for LogCommand {
     }
     async fn exec(
         &self,
-        uart: &mut Uart<'static, Async>,
+        uart: &mut UartTx<'static, Async>,
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
@@ -336,7 +335,7 @@ impl Command for RebootCommand {
     }
     async fn exec(
         &self,
-        uart: &mut Uart<'static, Async>,
+        uart: &mut UartTx<'static, Async>,
         _led: &mut Output<'static>,
         _args: &[&str],
         _uid_str: &str,
@@ -358,7 +357,7 @@ impl Command for AuthCommand {
     }
     async fn exec(
         &self,
-        uart: &mut Uart<'static, Async>,
+        uart: &mut UartTx<'static, Async>,
         _led: &mut Output<'static>,
         args: &[&str],
         uid_str: &str,
@@ -394,7 +393,7 @@ impl Command for MkdirCommand {
     }
     async fn exec(
         &self,
-        uart: &mut Uart<'static, Async>,
+        uart: &mut UartTx<'static, Async>,
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
@@ -421,7 +420,7 @@ impl Command for CdCommand {
     }
     async fn exec(
         &self,
-        uart: &mut Uart<'static, Async>,
+        uart: &mut UartTx<'static, Async>,
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
@@ -446,7 +445,7 @@ impl Command for LsCommand {
     }
     async fn exec(
         &self,
-        uart: &mut Uart<'static, Async>,
+        uart: &mut UartTx<'static, Async>,
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
@@ -468,7 +467,7 @@ impl Command for CatCommand {
     }
     async fn exec(
         &self,
-        uart: &mut Uart<'static, Async>,
+        uart: &mut UartTx<'static, Async>,
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
@@ -483,7 +482,7 @@ impl Command for CatCommand {
 
 pub async fn handle_command(
     line: &str,
-    uart: &mut Uart<'static, Async>,
+    uart: &mut UartTx<'static, Async>,
     led: &mut Output<'static>,
     uid_str: &str,
     from_ble: bool,

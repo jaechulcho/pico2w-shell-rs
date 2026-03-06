@@ -127,7 +127,7 @@ pub async fn write_log(msg: &str) -> Result<(), littlefs2::io::Error> {
 }
 
 pub async fn log_print(
-    uart: &mut embassy_rp::uart::Uart<'static, embassy_rp::uart::Async>,
+    uart: &mut embassy_rp::uart::UartTx<'static, embassy_rp::uart::Async>,
 ) -> Result<(), littlefs2::io::Error> {
     let mut fs_guard = FS.lock().await;
     let fs_locked = match fs_guard.as_mut() {
@@ -292,7 +292,7 @@ pub struct DirEntryInfo {
 }
 
 pub async fn fs_ls(
-    uart: &mut embassy_rp::uart::Uart<'static, embassy_rp::uart::Async>,
+    uart: &mut embassy_rp::uart::UartTx<'static, embassy_rp::uart::Async>,
     path: Option<&str>,
 ) -> Result<(), ()> {
     let cwd_str = pwd().await;
@@ -353,7 +353,7 @@ pub async fn fs_ls(
 }
 
 pub async fn fs_cat(
-    uart: &mut embassy_rp::uart::Uart<'static, embassy_rp::uart::Async>,
+    uart: &mut embassy_rp::uart::UartTx<'static, embassy_rp::uart::Async>,
     path: &str,
 ) -> Result<(), ()> {
     let cwd_str = pwd().await;
