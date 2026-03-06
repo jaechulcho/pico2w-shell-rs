@@ -126,9 +126,7 @@ pub async fn write_log(msg: &str) -> Result<(), littlefs2::io::Error> {
     log_write_all(msg.as_bytes()).await
 }
 
-pub async fn log_print(
-    uart: &mut embassy_rp::uart::UartTx<'static, embassy_rp::uart::Blocking>,
-) -> Result<(), littlefs2::io::Error> {
+pub async fn log_print(out: &mut crate::cli::CliOutput<'_>) -> Result<(), littlefs2::io::Error> {
     let mut fs_guard = FS.lock().await;
     let fs_locked = match fs_guard.as_mut() {
         Some(fs) => fs,
@@ -161,7 +159,7 @@ pub async fn log_print(
                 }
 
                 offset += bytes_read;
-                crate::cli::uart_write_all(uart, &buf[..bytes_read]).await;
+                crate::cli::uart_write_all(out, &buf[..bytes_read]).await;
             }
         }
     }
@@ -291,10 +289,7 @@ pub struct DirEntryInfo {
     pub size: usize,
 }
 
-pub async fn fs_ls(
-    uart: &mut embassy_rp::uart::UartTx<'static, embassy_rp::uart::Blocking>,
-    path: Option<&str>,
-) -> Result<(), ()> {
+pub async fn fs_ls(out: &mut crate::cli::CliOutput<'_>, path: Option<&str>) -> Result<(), ()> {
     let cwd_str = pwd().await;
     let target_path = path.unwrap_or(cwd_str.as_str());
     let resolved = resolve_path_str(cwd_str.as_str(), target_path);
@@ -308,7 +303,7 @@ pub async fn fs_ls(
 
     let mut buf = heapless::String::<128>::new();
     core::write!(&mut buf, "Directory of {}:\r\n", resolved.as_str()).ok();
-    crate::cli::uart_write_all(uart, buf.as_bytes()).await;
+    crate::cli::uart_write_all(out, buf.as_bytes()).await;
 
     let mut entries = heapless::Vec::<DirEntryInfo, 32>::new();
     let _ = fs_locked.0.read_dir_and_then(&lfs_path, |dir| {
@@ -345,15 +340,12 @@ pub async fn fs_ls(
             )
             .ok();
         }
-        crate::cli::uart_write_all(uart, line.as_bytes()).await;
+        crate::cli::uart_write_all(out, line.as_bytes()).await;
     }
     Ok(())
 }
 
-pub async fn fs_cat(
-    uart: &mut embassy_rp::uart::UartTx<'static, embassy_rp::uart::Blocking>,
-    path: &str,
-) -> Result<(), ()> {
+pub async fn fs_cat(out: &mut crate::cli::CliOutput<'_>, path: &str) -> Result<(), ()> {
     let cwd_str = pwd().await;
     let resolved = resolve_path_str(cwd_str.as_str(), path);
     let lfs_path = to_lfs_path(&resolved);
@@ -368,7 +360,7 @@ pub async fn fs_cat(
     if meta.is_dir() {
         let mut buf = heapless::String::<64>::new();
         core::write!(&mut buf, "error: {} is a directory\r\n", path).ok();
-        crate::cli::uart_write_all(uart, buf.as_bytes()).await;
+        crate::cli::uart_write_all(out, buf.as_bytes()).await;
         return Err(());
     }
 
@@ -389,7 +381,7 @@ pub async fn fs_cat(
         if res.is_err() {
             let mut buf_str = heapless::String::<64>::new();
             core::write!(&mut buf_str, "error: could not read file\r\n").ok();
-            crate::cli::uart_write_all(uart, buf_str.as_bytes()).await;
+            crate::cli::uart_write_all(out, buf_str.as_bytes()).await;
             return Err(());
         }
 
@@ -398,8 +390,8 @@ pub async fn fs_cat(
         }
 
         offset += bytes_read;
-        crate::cli::uart_write_all(uart, &buf[..bytes_read]).await;
+        crate::cli::uart_write_all(out, &buf[..bytes_read]).await;
     }
-    crate::cli::uart_write_all(uart, b"\r\n").await;
+    crate::cli::uart_write_all(out, b"\r\n").await;
     Ok(())
 }

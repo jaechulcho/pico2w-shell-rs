@@ -6,6 +6,7 @@
 
 mod cli;
 mod dhcp;
+mod http_server;
 mod log_filter;
 mod logger;
 
@@ -61,6 +62,22 @@ pub static TCP_TX_CHANNEL: embassy_sync::channel::Channel<
     16,
 > = embassy_sync::channel::Channel::new();
 
+pub struct WebCommand {
+    pub cmd: heapless::String<256>,
+}
+
+pub static WEB_CMD_CHANNEL: embassy_sync::channel::Channel<
+    embassy_sync::blocking_mutex::raw::ThreadModeRawMutex,
+    WebCommand,
+    2,
+> = embassy_sync::channel::Channel::new();
+
+pub static WEB_RESP_CHANNEL: embassy_sync::channel::Channel<
+    embassy_sync::blocking_mutex::raw::ThreadModeRawMutex,
+    heapless::String<2048>,
+    2,
+> = embassy_sync::channel::Channel::new();
+
 /// Task to handle UART CLI
 #[embassy_executor::task]
 async fn uart_task(uart: Uart<'static, Blocking>, mut led: Output<'static>, uid_str: &'static str) {
@@ -69,7 +86,7 @@ async fn uart_task(uart: Uart<'static, Blocking>, mut led: Output<'static>, uid_
     let mut idx = 0;
 
     cli::uart_write_all(
-        &mut tx,
+        &mut cli::CliOutput::Uart(&mut tx),
         b"\r\nPico 2W Shell (Embassy with WiFi TCP)\r\nType 'help' for commands.\r\n> ",
     )
     .await;
@@ -85,21 +102,28 @@ async fn uart_task(uart: Uart<'static, Blocking>, mut led: Output<'static>, uid_
         if let Some(c) = uart_byte {
             // Process UART byte
             if c == b'\r' || c == b'\n' {
-                cli::uart_write_all(&mut tx, b"\r\n").await;
+                cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), b"\r\n").await;
                 if idx > 0 {
                     if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
-                        cli::handle_command(line, &mut tx, &mut led, uid_str, false).await;
+                        cli::handle_command(
+                            line,
+                            &mut cli::CliOutput::Uart(&mut tx),
+                            &mut led,
+                            uid_str,
+                            false,
+                        )
+                        .await;
                     }
                     idx = 0;
                 }
-                cli::uart_write_all(&mut tx, b"> ").await;
+                cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), b"> ").await;
             } else if c == 0x08 || c == 0x7F {
                 if idx > 0 {
                     idx -= 1;
-                    cli::uart_write_all(&mut tx, b"\x08 \x08").await;
+                    cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), b"\x08 \x08").await;
                 }
             } else if idx < buf.len() {
-                cli::uart_write_all(&mut tx, &[c]).await;
+                cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), &[c]).await;
                 buf[idx] = c;
                 idx += 1;
             }
@@ -107,25 +131,45 @@ async fn uart_task(uart: Uart<'static, Blocking>, mut led: Output<'static>, uid_
             // Process TCP Data
             for &c in tcp_data.iter() {
                 if c == b'\r' || c == b'\n' {
-                    cli::uart_write_all(&mut tx, b"\r\n").await;
+                    cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), b"\r\n").await;
                     if idx > 0 {
                         if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
-                            cli::handle_command(line, &mut tx, &mut led, uid_str, true).await;
+                            cli::handle_command(
+                                line,
+                                &mut cli::CliOutput::Uart(&mut tx),
+                                &mut led,
+                                uid_str,
+                                true,
+                            )
+                            .await;
                         }
                         idx = 0;
                     }
-                    cli::uart_write_all(&mut tx, b"> ").await;
+                    cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), b"> ").await;
                 } else if c == 0x08 || c == 0x7F {
                     if idx > 0 {
                         idx -= 1;
-                        cli::uart_write_all(&mut tx, b"\x08 \x08").await;
+                        cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), b"\x08 \x08").await;
                     }
                 } else if idx < buf.len() {
-                    cli::uart_write_all(&mut tx, &[c]).await;
+                    cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), &[c]).await;
                     buf[idx] = c;
                     idx += 1;
                 }
             }
+        } else if let Ok(web_cmd) = WEB_CMD_CHANNEL.try_receive() {
+            defmt::info!("Main Loop received web command: {}", web_cmd.cmd.as_str());
+            let mut buf = heapless::String::<2048>::new();
+            cli::handle_command(
+                web_cmd.cmd.as_str(),
+                &mut cli::CliOutput::Buffer(&mut buf),
+                &mut led,
+                uid_str,
+                true,
+            )
+            .await;
+            defmt::info!("Main Loop returning web response: {}", buf.as_str());
+            let _ = WEB_RESP_CHANNEL.try_send(buf);
         } else {
             // Yield executor to allow CYW43 and TCP to run
             embassy_time::Timer::after(embassy_time::Duration::from_millis(5)).await;
@@ -295,17 +339,18 @@ async fn main(spawner: Spawner) {
 
     // Generate MAC address to avoid clash or just give random MAC Seed.
     static STACK: StaticCell<Stack> = StaticCell::new();
-    static RESOURCES: StaticCell<StackResources<2>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
     let (stack_inst, net_runner) = embassy_net::new(
         net_device,
         config,
-        RESOURCES.init(StackResources::<2>::new()),
+        RESOURCES.init(StackResources::<3>::new()),
         uid_u64,
     );
     let stack = &*STACK.init(stack_inst);
 
     spawner.spawn(unwrap!(net_task(net_runner)));
     spawner.spawn(unwrap!(tcp_server_task(*stack)));
+    spawner.spawn(unwrap!(http_server::http_server_task(*stack)));
     spawner.spawn(unwrap!(dhcp::dhcp_server_task(
         *stack,
         embassy_net::Ipv4Address::new(192, 168, 4, 1),
