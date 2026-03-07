@@ -88,7 +88,14 @@ async fn blink_task(mut control: cyw43::Control<'static>) {
                 }
                 let _ = json.push_str("]");
                 defmt::info!("Scan complete!");
-                let _ = crate::WIFI_SCAN_RESP_CHANNEL.send(json).await;
+                for chunk in json.as_bytes().chunks(64) {
+                    let mut vec = heapless::Vec::<u8, 64>::new();
+                    let _ = vec.extend_from_slice(chunk);
+                    let _ = crate::WIFI_SCAN_RESP_CHANNEL
+                        .send(WebResponse::Chunk(vec))
+                        .await;
+                }
+                let _ = crate::WIFI_SCAN_RESP_CHANNEL.send(WebResponse::Done).await;
             }
             Err(_) => {} // Timeout
         }
@@ -132,7 +139,14 @@ async fn blink_task(mut control: cyw43::Control<'static>) {
                 }
                 let _ = json.push_str("]");
                 defmt::info!("Scan complete!");
-                let _ = crate::WIFI_SCAN_RESP_CHANNEL.send(json).await;
+                for chunk in json.as_bytes().chunks(64) {
+                    let mut vec = heapless::Vec::<u8, 64>::new();
+                    let _ = vec.extend_from_slice(chunk);
+                    let _ = crate::WIFI_SCAN_RESP_CHANNEL
+                        .send(WebResponse::Chunk(vec))
+                        .await;
+                }
+                let _ = crate::WIFI_SCAN_RESP_CHANNEL.send(WebResponse::Done).await;
             }
             Err(_) => {} // Timeout
         }
@@ -151,6 +165,11 @@ pub static TCP_TX_CHANNEL: embassy_sync::channel::Channel<
     16,
 > = embassy_sync::channel::Channel::new();
 
+pub enum WebResponse {
+    Chunk(heapless::Vec<u8, 64>),
+    Done,
+}
+
 pub struct WebCommand {
     pub cmd: heapless::String<256>,
 }
@@ -163,8 +182,8 @@ pub static WEB_CMD_CHANNEL: embassy_sync::channel::Channel<
 
 pub static WEB_RESP_CHANNEL: embassy_sync::channel::Channel<
     embassy_sync::blocking_mutex::raw::ThreadModeRawMutex,
-    heapless::String<2048>,
-    2,
+    WebResponse,
+    32, // More slots for streaming
 > = embassy_sync::channel::Channel::new();
 
 pub static WIFI_SCAN_REQ_CHANNEL: embassy_sync::channel::Channel<
@@ -175,8 +194,8 @@ pub static WIFI_SCAN_REQ_CHANNEL: embassy_sync::channel::Channel<
 
 pub static WIFI_SCAN_RESP_CHANNEL: embassy_sync::channel::Channel<
     embassy_sync::blocking_mutex::raw::ThreadModeRawMutex,
-    heapless::String<2048>,
-    1,
+    WebResponse,
+    32,
 > = embassy_sync::channel::Channel::new();
 
 /// Task to handle UART CLI
@@ -277,18 +296,22 @@ async fn uart_task(
             }
         } else if let Ok(web_cmd) = WEB_CMD_CHANNEL.try_receive() {
             defmt::info!("Main Loop received web command: {}", web_cmd.cmd.as_str());
-            let mut buf = heapless::String::<2048>::new();
+
+            // Clear any stale responses before starting
+            while let Ok(_) = WEB_RESP_CHANNEL.try_receive() {}
+
+            let mut web_sender = WEB_RESP_CHANNEL.sender();
             cli::handle_command(
                 web_cmd.cmd.as_str(),
-                &mut cli::CliOutput::Buffer(&mut buf),
+                &mut cli::CliOutput::Web(&mut web_sender),
                 &mut led,
                 uid_str,
                 true,
                 stack,
             )
             .await;
-            defmt::info!("Main Loop returning web response: {}", buf.as_str());
-            let _ = WEB_RESP_CHANNEL.try_send(buf);
+            defmt::info!("Main Loop command handling done.");
+            let _ = WEB_RESP_CHANNEL.send(WebResponse::Done).await;
         } else {
             // Yield executor to allow CYW43 and TCP to run
             embassy_time::Timer::after(embassy_time::Duration::from_millis(5)).await;

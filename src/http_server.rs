@@ -236,17 +236,28 @@ pub async fn http_server_task(stack: Stack<'static>, is_sta: bool) {
                     let web_cmd = crate::WebCommand { cmd: cmd_str };
                     let _ = crate::WEB_CMD_CHANNEL.send(web_cmd).await;
 
-                    let response_str = crate::WEB_RESP_CHANNEL.receive().await;
-
                     let mut header = heapless::String::<128>::new();
                     core::write!(
                         &mut header,
-                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
-                        response_str.len()
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json; charset=utf-8\r\n\r\n"
                     ).ok();
 
                     let _ = socket.write_all(header.as_bytes()).await;
-                    let _ = socket.write_all(response_str.as_bytes()).await;
+                    let mut write_failed = false;
+                    loop {
+                        match crate::WIFI_SCAN_RESP_CHANNEL.receive().await {
+                            crate::WebResponse::Chunk(chunk) => {
+                                if !write_failed {
+                                    if let Err(_) = socket.write_all(chunk.as_slice()).await {
+                                        write_failed = true;
+                                    }
+                                }
+                            }
+                            crate::WebResponse::Done => break,
+                        }
+                    }
+                    let _ = socket.flush().await;
+                    socket.close();
                 } else if req.starts_with("POST /connect ") && !is_sta {
                     defmt::info!("HTTP POST /connect received");
                     let parts: heapless::Vec<&str, 2> = req.splitn(2, "\r\n\r\n").collect();
@@ -302,20 +313,29 @@ pub async fn http_server_task(stack: Stack<'static>, is_sta: bool) {
                         let web_cmd = crate::WebCommand { cmd: cmd_str };
                         let _ = crate::WEB_CMD_CHANNEL.send(web_cmd).await;
 
-                        // Wait for response
-                        let response_str = crate::WEB_RESP_CHANNEL.receive().await;
-                        defmt::info!("Sending Response: '{}'", response_str.as_str());
-
-                        // Form HTTP OK with strict headers
+                        // Wait for response and stream it
                         let mut header = heapless::String::<128>::new();
                         core::write!(
                             &mut header,
-                            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
-                            response_str.len()
+                            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"
                         ).ok();
 
                         let _ = socket.write_all(header.as_bytes()).await;
-                        let _ = socket.write_all(response_str.as_bytes()).await;
+                        let mut write_failed = false;
+                        loop {
+                            match crate::WEB_RESP_CHANNEL.receive().await {
+                                crate::WebResponse::Chunk(chunk) => {
+                                    if !write_failed {
+                                        if let Err(_) = socket.write_all(chunk.as_slice()).await {
+                                            write_failed = true;
+                                        }
+                                    }
+                                }
+                                crate::WebResponse::Done => break,
+                            }
+                        }
+                        let _ = socket.flush().await;
+                        socket.close();
                     } else {
                         defmt::warn!("POST bad format parts: {}", parts.len());
                         let _ = socket.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nMissing Body").await;

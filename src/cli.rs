@@ -17,6 +17,14 @@ pub enum CliOutput<'a> {
             16,
         >,
     ),
+    Web(
+        &'a mut embassy_sync::channel::Sender<
+            'static,
+            embassy_sync::blocking_mutex::raw::ThreadModeRawMutex,
+            crate::WebResponse,
+            32,
+        >,
+    ),
 }
 
 pub enum CommandEnum {
@@ -169,6 +177,14 @@ pub async fn uart_write_all(out: &mut CliOutput<'_>, buf: &[u8], _stack: Stack<'
                 let mut vec: heapless::Vec<u8, 64> = heapless::Vec::new();
                 if vec.extend_from_slice(chunk).is_ok() {
                     let _ = tx_ch.send(vec).await;
+                }
+            }
+        }
+        CliOutput::Web(tx_ch) => {
+            for chunk in buf.chunks(64) {
+                let mut vec: heapless::Vec<u8, 64> = heapless::Vec::new();
+                if vec.extend_from_slice(chunk).is_ok() {
+                    let _ = tx_ch.send(crate::WebResponse::Chunk(vec)).await;
                 }
             }
         }
@@ -730,9 +746,16 @@ impl Command for SysScanCommand {
         // Send scan trigger to main task
         let _ = crate::WIFI_SCAN_REQ_CHANNEL.send(()).await;
 
-        // Wait for JSON result
-        let result = crate::WIFI_SCAN_RESP_CHANNEL.receive().await;
-        uart_write_all(out, result.as_bytes(), stack).await;
+        // Wait for JSON result chunks
+        loop {
+            match crate::WIFI_SCAN_RESP_CHANNEL.receive().await {
+                crate::WebResponse::Chunk(chunk) => {
+                    uart_write_all(out, chunk.as_slice(), stack).await;
+                }
+                crate::WebResponse::Done => break,
+            }
+        }
+        uart_write_all(out, b"\r\n", stack).await;
     }
 }
 pub struct NtpCommand;
