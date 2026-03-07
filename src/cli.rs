@@ -275,7 +275,17 @@ impl Command for InfoCommand {
         } else {
             uart_write_all(out, b"IP: Not acquired\r\n", stack).await;
         }
-        uart_write_all(out, b"Hostname: pico.local\r\n", stack).await;
+        let short_id = if uid_str.len() >= 6 {
+            &uid_str[uid_str.len() - 6..]
+        } else {
+            uid_str
+        };
+        let mut host_str = heapless::String::<32>::new();
+        let _ = core::fmt::write(
+            &mut host_str,
+            format_args!("Hostname: pico-{}.local\r\n", short_id),
+        );
+        uart_write_all(out, host_str.as_bytes(), stack).await;
     }
 }
 

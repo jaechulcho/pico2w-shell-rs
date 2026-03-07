@@ -382,7 +382,7 @@ async fn net_config_task(stack: Stack<'static>) {
 }
 
 #[embassy_executor::task]
-async fn mdns_task(stack: Stack<'static>) {
+async fn mdns_task(stack: Stack<'static>, short_uid: &'static str) {
     let mut rx_meta = [PacketMetadata::EMPTY; 1];
     let mut rx_payload = [0u8; 512];
     let mut tx_meta = [PacketMetadata::EMPTY; 1];
@@ -404,37 +404,51 @@ async fn mdns_task(stack: Stack<'static>) {
         }
 
         let mut buf = [0u8; 512];
+        let mut query_needle = heapless::String::<32>::new();
+        let _ = core::fmt::write(
+            &mut query_needle,
+            format_args!("\x0bpico-{}\x05local", short_uid),
+        );
+
         match socket.recv_from(&mut buf).await {
             Ok((n, remote)) => {
                 let data = &buf[..n];
-                // Check for "pico" + "local" query (robust matching)
-                let found = data.windows(11).any(|w| {
-                    (w[0] == 4
-                        && (w[1] | 0x20) == b'p'
-                        && (w[2] | 0x20) == b'i'
-                        && (w[3] | 0x20) == b'c'
-                        && (w[4] | 0x20) == b'o')
-                        && (w[5] == 5
-                            && (w[6] | 0x20) == b'l'
-                            && (w[7] | 0x20) == b'o'
-                            && (w[8] | 0x20) == b'c'
-                            && (w[9] | 0x20) == b'a'
-                            && (w[10] | 0x20) == b'l')
-                });
-
-                if found {
-                    defmt::info!("mDNS query for pico.local received from {:?}", remote);
+                // Check for dynamic "pico-XXXXXX" + "local" query
+                if data.windows(query_needle.len()).any(|w| {
+                    w.iter()
+                        .zip(query_needle.as_bytes().iter())
+                        .all(|(a, b)| (a | 0x20) == (b | 0x20))
+                }) {
+                    defmt::info!(
+                        "mDNS query for {} received from {:?}",
+                        query_needle.as_str(),
+                        remote
+                    );
                     if let Some(config) = stack.config_v4() {
                         let ip = config.address.address();
                         let ip_bytes = ip.octets();
 
-                        let mut resp = [0u8; 64];
+                        let mut resp = [0u8; 128];
                         resp[0..4].copy_from_slice(&[0x00, 0x00, 0x84, 0x00]); // Answer + Authoritative
                         resp[4..12]
                             .copy_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
-                        let name = b"\x04pico\x05local\x00";
-                        resp[12..12 + name.len()].copy_from_slice(name);
-                        let mut pos = 12 + name.len();
+
+                        let mut pos = 12;
+                        // First label: pico-XXXXXX
+                        resp[pos] = 11;
+                        pos += 1;
+                        resp[pos..pos + 5].copy_from_slice(b"pico-");
+                        pos += 5;
+                        resp[pos..pos + 6].copy_from_slice(short_uid.as_bytes());
+                        pos += 6;
+                        // Second label: local
+                        resp[pos] = 5;
+                        pos += 1;
+                        resp[pos..pos + 5].copy_from_slice(b"local");
+                        pos += 5;
+                        resp[pos] = 0;
+                        pos += 1;
+
                         resp[pos..pos + 4].copy_from_slice(&[0x00, 0x01, 0x00, 0x01]); // Type A, Class IN
                         pos += 4;
                         resp[pos..pos + 4].copy_from_slice(&[0x00, 0x00, 0x00, 0x78]); // TTL 120
@@ -493,6 +507,10 @@ async fn main(spawner: Spawner) {
         ),
     )
     .unwrap();
+
+    static SHORT_UID: StaticCell<heapless::String<6>> = StaticCell::new();
+    let short_uid = SHORT_UID.init(heapless::String::new());
+    let _ = short_uid.push_str(&uid_str[uid_str.len() - 6..]);
 
     static BLE_NAME: StaticCell<heapless::String<64>> = StaticCell::new();
     let ble_name = BLE_NAME.init(heapless::String::new());
@@ -579,7 +597,7 @@ async fn main(spawner: Spawner) {
         spawner.spawn(unwrap!(tcp_server_task(*stack)));
         spawner.spawn(unwrap!(http_server::http_server_task(*stack, true)));
         spawner.spawn(unwrap!(net_config_task(*stack)));
-        spawner.spawn(unwrap!(mdns_task(*stack)));
+        spawner.spawn(unwrap!(mdns_task(*stack, short_uid.as_str())));
 
         let _ = uart.blocking_write(b"-> Joining Wi-Fi AP...\r\n");
 
@@ -642,7 +660,7 @@ async fn main(spawner: Spawner) {
             *stack,
             embassy_net::Ipv4Address::new(192, 168, 4, 1),
         )));
-        spawner.spawn(unwrap!(mdns_task(*stack)));
+        spawner.spawn(unwrap!(mdns_task(*stack, short_uid.as_str())));
 
         let _ = uart.blocking_write(b"-> Starting SoftAP...\r\n");
         let _ = control.start_ap_wpa2(ble_name.as_str(), passkey, 6).await;
