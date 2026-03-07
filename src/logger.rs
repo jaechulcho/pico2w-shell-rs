@@ -394,25 +394,20 @@ pub async fn write_wifi_conf(ssid: &str, pass: &str) -> Result<(), ()> {
     Ok(())
 }
 
-pub async fn log_print(
+async fn print_lfs_file(
+    fs: &mut Filesystem<'static, PicoFlashStorage>,
+    path: &littlefs2::path::Path,
     out: &mut crate::cli::CliOutput<'_>,
     stack: embassy_net::Stack<'static>,
 ) -> Result<(), ()> {
-    let mut fs_guard = FS.lock().await;
-    let fs_locked = match fs_guard.as_mut() {
-        Some(fs) => fs,
-        None => return Ok(()),
-    };
-
-    let path = to_lfs_path("/log.txt");
     let mut buf = [0u8; 512];
     let mut offset = 0;
 
     loop {
         let mut len = 0;
-        let res = fs_locked.0.open_file_with_options_and_then(
+        let res = fs.open_file_with_options_and_then(
             |o| o.read(true),
-            &path,
+            path,
             |file| {
                 file.seek(littlefs2::io::SeekFrom::Start(offset))?;
                 len = file.read(&mut buf)?;
@@ -428,6 +423,31 @@ pub async fn log_print(
         offset += len as u32;
     }
     Ok(())
+}
+
+pub async fn log_print(
+    out: &mut crate::cli::CliOutput<'_>,
+    stack: embassy_net::Stack<'static>,
+) -> Result<(), ()> {
+    let mut fs_guard = FS.lock().await;
+    let fs_locked = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return Ok(()),
+    };
+
+    // 1. Print rotated log if exists
+    let old_path = littlefs2::path!("syslog.0.txt");
+    if fs_locked.0.metadata(old_path).is_ok() {
+        let _ =
+            crate::cli::uart_write_all(out, b"--- Rotated Log (syslog.0.txt) ---\r\n", stack).await;
+        let _ = print_lfs_file(&mut fs_locked.0, old_path, out, stack).await;
+        let _ = crate::cli::uart_write_all(out, b"--- End of Rotated Log ---\r\n", stack).await;
+    }
+
+    // 2. Print current log
+    let path = littlefs2::path!("syslog.txt");
+    let _ = crate::cli::uart_write_all(out, b"--- Current Log (syslog.txt) ---\r\n", stack).await;
+    print_lfs_file(&mut fs_locked.0, path, out, stack).await
 }
 
 pub async fn read_wifi_conf() -> Option<WifiConfig> {
