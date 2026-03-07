@@ -33,6 +33,8 @@ pub enum CommandEnum {
     Cat(CatCommand),
     WifiReset(WifiResetCommand),
     SysScan(SysScanCommand),
+    Ntp(NtpCommand),
+    Tz(TzCommand),
 }
 
 impl CommandEnum {
@@ -52,6 +54,8 @@ impl CommandEnum {
             Self::Cat(c) => c.name(),
             Self::WifiReset(c) => c.name(),
             Self::SysScan(c) => c.name(),
+            Self::Ntp(c) => c.name(),
+            Self::Tz(c) => c.name(),
         }
     }
 
@@ -70,6 +74,28 @@ impl CommandEnum {
             Self::Cat(c) => c.description(),
             Self::WifiReset(c) => c.description(),
             Self::SysScan(c) => c.description(),
+            Self::Ntp(c) => c.description(),
+            Self::Tz(c) => c.description(),
+        }
+    }
+
+    fn authenticated(&self) -> bool {
+        match self {
+            Self::Help(c) => c.authenticated(),
+            Self::Led(c) => c.authenticated(),
+            Self::Info(c) => c.authenticated(),
+            Self::Echo(c) => c.authenticated(),
+            Self::Log(c) => c.authenticated(),
+            Self::Auth(c) => c.authenticated(),
+            Self::Reboot(c) => c.authenticated(),
+            Self::Mkdir(c) => c.authenticated(),
+            Self::Cd(c) => c.authenticated(),
+            Self::Ls(c) => c.authenticated(),
+            Self::Cat(c) => c.authenticated(),
+            Self::WifiReset(c) => c.authenticated(),
+            Self::SysScan(c) => c.authenticated(),
+            Self::Ntp(c) => c.authenticated(),
+            Self::Tz(c) => c.authenticated(),
         }
     }
 
@@ -95,6 +121,8 @@ impl CommandEnum {
             Self::Cat(c) => c.exec(out, led, args, uid_str, stack).await,
             Self::WifiReset(c) => c.exec(out, led, args, uid_str, stack).await,
             Self::SysScan(c) => c.exec(out, led, args, uid_str, stack).await,
+            Self::Ntp(c) => c.exec(out, led, args, uid_str, stack).await,
+            Self::Tz(c) => c.exec(out, led, args, uid_str, stack).await,
         }
     }
 }
@@ -113,6 +141,8 @@ const COMMANDS: &[CommandEnum] = &[
     CommandEnum::Cat(CatCommand),
     CommandEnum::WifiReset(WifiResetCommand),
     CommandEnum::SysScan(SysScanCommand),
+    CommandEnum::Ntp(NtpCommand),
+    CommandEnum::Tz(TzCommand),
 ];
 
 static TCP_AUTHENTICATED: AtomicBool = AtomicBool::new(false);
@@ -124,7 +154,9 @@ pub async fn uart_write_all(out: &mut CliOutput<'_>, buf: &[u8], _stack: Stack<'
     match out {
         CliOutput::Uart(uart) => {
             for &b in buf {
-                while let Err(nb::Error::WouldBlock) = uart.write(b) {}
+                while let Err(nb::Error::WouldBlock) = uart.write(b) {
+                    embassy_time::Timer::after_ticks(1).await;
+                }
             }
         }
         CliOutput::Buffer(s) => {
@@ -154,6 +186,9 @@ pub trait Command {
         uid_str: &str,
         stack: Stack<'static>,
     );
+    fn authenticated(&self) -> bool {
+        true
+    }
 }
 
 pub struct HelpCommand;
@@ -163,6 +198,9 @@ impl Command for HelpCommand {
     }
     fn description(&self) -> &str {
         "Show this help"
+    }
+    fn authenticated(&self) -> bool {
+        false
     }
     async fn exec(
         &self,
@@ -286,6 +324,31 @@ impl Command for InfoCommand {
             format_args!("Hostname: pico-{}.local\r\n", short_id),
         );
         uart_write_all(out, host_str.as_bytes(), stack).await;
+
+        if let Some(dt) = crate::logger::get_rtc_time().await {
+            let mut time_str = heapless::String::<64>::new();
+            let _ = core::fmt::write(
+                &mut time_str,
+                format_args!(
+                    "RTC Time: {:04}-{:02}-{:02} {:02}:{:02}:{:02}\r\n",
+                    dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
+                ),
+            );
+
+            if let Some(tz) = crate::logger::read_tz_conf().await {
+                let mut tz_str = heapless::String::<32>::new();
+                let hrs = tz.offset_minutes as f32 / 60.0;
+                let _ = core::fmt::write(
+                    &mut tz_str,
+                    format_args!("Timezone Offset: {} hrs\r\n", hrs),
+                );
+                uart_write_all(out, tz_str.as_bytes(), stack).await;
+            }
+
+            uart_write_all(out, time_str.as_bytes(), stack).await;
+        } else {
+            uart_write_all(out, b"RTC Time: Not synchronized\r\n", stack).await;
+        }
     }
 }
 
@@ -407,6 +470,9 @@ impl Command for RebootCommand {
     fn description(&self) -> &str {
         "Reset the system"
     }
+    fn authenticated(&self) -> bool {
+        false
+    }
     async fn exec(
         &self,
         out: &mut CliOutput<'_>,
@@ -430,6 +496,9 @@ impl Command for AuthCommand {
     fn description(&self) -> &str {
         "Authenticate the BLE connection"
     }
+    fn authenticated(&self) -> bool {
+        false
+    }
     async fn exec(
         &self,
         out: &mut CliOutput<'_>,
@@ -452,6 +521,7 @@ impl Command for AuthCommand {
 
         if args[0] == passkey {
             TCP_AUTHENTICATED.store(true, Ordering::SeqCst);
+            let _ = crate::logger::write_log("User Authorized (Shell Unlocked)").await;
             uart_write_all(
                 out,
                 b"Authentication successful. Shell unlocked.\r\n",
@@ -584,11 +654,7 @@ pub async fn handle_command(
     match target {
         Some(cmd) => {
             // 2. 인증 체크 (메서드 활용)
-            if from_tcp
-                && !TCP_AUTHENTICATED.load(Ordering::SeqCst)
-                && cmd_name != AuthCommand.name()
-                && cmd_name != RebootCommand.name()
-            {
+            if from_tcp && !TCP_AUTHENTICATED.load(Ordering::SeqCst) && cmd.authenticated() {
                 uart_write_all(
                     out,
                     b"Unauthored. Please run 'auth <passkey>' first.\r\n",
@@ -667,5 +733,125 @@ impl Command for SysScanCommand {
         // Wait for JSON result
         let result = crate::WIFI_SCAN_RESP_CHANNEL.receive().await;
         uart_write_all(out, result.as_bytes(), stack).await;
+    }
+}
+pub struct NtpCommand;
+impl Command for NtpCommand {
+    fn name(&self) -> &str {
+        "ntp"
+    }
+    fn description(&self) -> &str {
+        "Configure NTP server (set <server>)"
+    }
+    fn authenticated(&self) -> bool {
+        false
+    }
+    async fn exec(
+        &self,
+        out: &mut CliOutput<'_>,
+        _led: &mut Output<'static>,
+        args: &[&str],
+        _uid_str: &str,
+        stack: embassy_net::Stack<'static>,
+    ) {
+        if args.is_empty() {
+            if let Some(conf) = crate::logger::read_ntp_conf().await {
+                let _ = uart_write_all(out, b"Current NTP Server: ", stack).await;
+                let _ = uart_write_all(out, conf.server.as_bytes(), stack).await;
+                let _ = uart_write_all(out, b"\r\n", stack).await;
+            } else {
+                let _ = uart_write_all(
+                    out,
+                    b"NTP Server: Not configured (using pool.ntp.org)\r\n",
+                    stack,
+                )
+                .await;
+            }
+            return;
+        }
+
+        match args[0] {
+            "set" => {
+                if args.len() > 1 {
+                    if crate::logger::write_ntp_conf(args[1]).await.is_ok() {
+                        let _ = uart_write_all(out, b"NTP Server saved.\r\n", stack).await;
+                    } else {
+                        let _ = uart_write_all(out, b"Failed to save NTP Server.\r\n", stack).await;
+                    }
+                } else {
+                    let _ = uart_write_all(out, b"Usage: ntp set <server>\r\n", stack).await;
+                }
+            }
+            _ => {
+                let _ = uart_write_all(
+                    out,
+                    b"Unknown ntp command. Use 'ntp set <server>'.\r\n",
+                    stack,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+pub struct TzCommand;
+impl Command for TzCommand {
+    fn name(&self) -> &str {
+        "tz"
+    }
+    fn description(&self) -> &str {
+        "Set/Show timezone offset (e.g. tz set 9)"
+    }
+    async fn exec(
+        &self,
+        out: &mut CliOutput<'_>,
+        _led: &mut Output<'static>,
+        args: &[&str],
+        _uid_str: &str,
+        stack: Stack<'static>,
+    ) {
+        if args.len() >= 2 && args[0] == "set" {
+            // Parse decimal hours
+            if let Ok(offset_hrs) = args[1].parse::<f32>() {
+                let offset_mins: i32 = (offset_hrs * 60.0) as i32;
+                if crate::logger::write_tz_conf(offset_mins).await.is_ok() {
+                    uart_write_all(
+                        out,
+                        b"Timezone offset saved. Please re-sync NTP.\r\n",
+                        stack,
+                    )
+                    .await;
+                } else {
+                    uart_write_all(out, b"Error saving timezone.\r\n", stack).await;
+                }
+            } else {
+                uart_write_all(out, b"Usage: tz set <offset_in_hours>\r\n", stack).await;
+            }
+        } else {
+            let mut info_msg = heapless::String::<128>::new();
+            if let Some(tz) = crate::logger::read_tz_conf().await {
+                let hrs = tz.offset_minutes as f32 / 60.0;
+                let _ = core::fmt::write(
+                    &mut info_msg,
+                    format_args!("Current Timezone Offset: {} hrs\r\n", hrs),
+                );
+            } else {
+                let _ = info_msg.push_str("Current Timezone Offset: 0 (UTC)\r\n");
+            }
+
+            if let Some(dt) = crate::logger::get_rtc_time().await {
+                let _ = core::fmt::write(
+                    &mut info_msg,
+                    format_args!(
+                        "Current Local Time: {:04}-{:02}-{:02} {:02}:{:02}:{:02}\r\n",
+                        dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
+                    ),
+                );
+            }
+            uart_write_all(out, info_msg.as_bytes(), stack).await;
+        }
+    }
+    fn authenticated(&self) -> bool {
+        false
     }
 }

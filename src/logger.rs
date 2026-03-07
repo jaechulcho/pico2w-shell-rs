@@ -2,8 +2,11 @@
 
 use core::fmt::Write as _;
 
+use embassy_rp::Peri;
+use embassy_rp::aon_timer::{AonTimer, DateTime};
 use embassy_rp::flash::{Async, Flash};
 use embassy_rp::peripherals::FLASH;
+use embassy_rp::peripherals::POWMAN;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::Instant;
@@ -63,8 +66,18 @@ unsafe impl Send for FsWrapper {}
 static FLASH_STORAGE: StaticCell<PicoFlashStorage> = StaticCell::new();
 static ALLOCATION: StaticCell<Allocation<PicoFlashStorage>> = StaticCell::new();
 static FS: Mutex<CriticalSectionRawMutex, Option<FsWrapper>> = Mutex::new(None);
+static RTC: Mutex<CriticalSectionRawMutex, Option<AonTimer<'static>>> = Mutex::new(None);
 
-pub fn init(flash: Flash<'static, FLASH, Async, FLASH_SIZE>) -> Result<(), littlefs2::io::Error> {
+pub fn init<
+    I: embassy_rp::interrupt::typelevel::Binding<
+            embassy_rp::interrupt::typelevel::POWMAN_IRQ_TIMER,
+            embassy_rp::aon_timer::InterruptHandler,
+        > + 'static,
+>(
+    flash: Flash<'static, FLASH, Async, FLASH_SIZE>,
+    powman: Peri<'static, POWMAN>,
+    irqs: I,
+) -> Result<(), littlefs2::io::Error> {
     let storage_ref = FLASH_STORAGE.init(PicoFlashStorage::new(flash));
     let alloc_ref = ALLOCATION.init(Filesystem::allocate());
 
@@ -77,7 +90,35 @@ pub fn init(flash: Flash<'static, FLASH, Async, FLASH_SIZE>) -> Result<(), littl
     if let Ok(mut g) = FS.try_lock() {
         *g = Some(FsWrapper(fs));
     }
+    let mut rtc_inst = AonTimer::new(powman, irqs, embassy_rp::aon_timer::Config::default());
+    rtc_inst.start();
+    if let Ok(mut g) = RTC.try_lock() {
+        *g = Some(rtc_inst);
+    }
+
     Ok(())
+}
+
+pub async fn set_rtc_time(dt: DateTime) -> Result<(), ()> {
+    let mut guard = RTC.lock().await;
+    if let Some(rtc) = guard.as_mut() {
+        // AonTimer panics on set_datetime if running, so stop first
+        rtc.stop();
+        let _ = rtc.set_datetime(dt);
+        rtc.start();
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+pub async fn get_rtc_time() -> Option<DateTime> {
+    if let Ok(mut guard) = RTC.try_lock() {
+        if let Some(rtc) = guard.as_mut() {
+            return rtc.now_as_datetime().ok();
+        }
+    }
+    None
 }
 
 const LOG_FILE: &[u8] = b"syslog.txt\0";
@@ -104,15 +145,37 @@ pub async fn log_write_all(message: &[u8]) -> Result<(), littlefs2::io::Error> {
         let _ = fs_locked.0.rename(path, old_path);
     }
 
+    // Check for RTC time
+    let mut time_str: heapless::String<32> = heapless::String::new();
+    if let Ok(mut guard) = RTC.try_lock() {
+        if let Some(rtc) = guard.as_mut() {
+            if let Ok(dt) = rtc.now_as_datetime() {
+                let _ = core::write!(
+                    &mut time_str,
+                    "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}] ",
+                    dt.year,
+                    dt.month,
+                    dt.day,
+                    dt.hour,
+                    dt.minute,
+                    dt.second
+                );
+            } else {
+                let _ = core::write!(&mut time_str, "[{} ms] ", ms);
+            }
+        } else {
+            let _ = core::write!(&mut time_str, "[{} ms] ", ms);
+        }
+    } else {
+        let _ = core::write!(&mut time_str, "[{} ms] ", ms);
+    }
+
     // Append to log
     fs_locked.0.open_file_with_options_and_then(
         |o| o.write(true).create(true).append(true),
         path,
         |file| {
-            let mut line_buf: heapless::String<256> = heapless::String::new();
-            core::write!(&mut line_buf, "[{} ms] ", ms).ok();
-
-            file.write(line_buf.as_bytes())?;
+            file.write(time_str.as_bytes())?;
             file.write(message)?;
             file.write(b"\r\n")?;
             Ok(())
@@ -496,4 +559,128 @@ pub async fn delete_wifi_conf() -> Result<(), ()> {
 
     let path = to_lfs_path("/wifi.conf");
     fs_locked.0.remove(&path).map_err(|_| ())
+}
+
+pub struct NtpConfig {
+    pub server: heapless::String<64>,
+}
+
+pub async fn write_ntp_conf(server: &str) -> Result<(), ()> {
+    let mut fs_guard = FS.lock().await;
+    let fs_locked = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return Err(()),
+    };
+
+    let path = to_lfs_path("/ntp.conf");
+    let mut data = heapless::String::<64>::new();
+    let _ = data.push_str(server);
+
+    fs_locked
+        .0
+        .open_file_with_options_and_then(
+            |o| o.write(true).create(true).truncate(true),
+            &path,
+            |file| {
+                file.write(data.as_bytes())?;
+                Ok(())
+            },
+        )
+        .map_err(|_| ())?;
+
+    Ok(())
+}
+
+pub async fn read_ntp_conf() -> Option<NtpConfig> {
+    let mut fs_guard = FS.lock().await;
+    let fs_locked = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return None,
+    };
+
+    let path = to_lfs_path("/ntp.conf");
+    let mut buf = [0u8; 64];
+    let mut len = 0;
+
+    let res = fs_locked.0.open_file_with_options_and_then(
+        |o| o.read(true),
+        &path,
+        |file| {
+            len = file.read(&mut buf)?;
+            Ok(())
+        },
+    );
+
+    if res.is_err() || len == 0 {
+        return None;
+    }
+
+    if let Ok(server_str) = core::str::from_utf8(&buf[..len]) {
+        let mut server = heapless::String::<64>::new();
+        let _ = server.push_str(server_str.trim());
+        return Some(NtpConfig { server });
+    }
+    None
+}
+
+pub struct TzConfig {
+    pub offset_minutes: i32,
+}
+
+pub async fn write_tz_conf(offset_minutes: i32) -> Result<(), ()> {
+    let mut fs_guard = FS.lock().await;
+    let fs_locked = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return Err(()),
+    };
+
+    let path = to_lfs_path("/timezone.conf");
+    let mut data = heapless::String::<16>::new();
+    let _ = core::write!(&mut data, "{}", offset_minutes);
+
+    fs_locked
+        .0
+        .open_file_with_options_and_then(
+            |o| o.write(true).create(true).truncate(true),
+            &path,
+            |file| {
+                file.write(data.as_bytes())?;
+                Ok(())
+            },
+        )
+        .map_err(|_| ())?;
+
+    Ok(())
+}
+
+pub async fn read_tz_conf() -> Option<TzConfig> {
+    let mut fs_guard = FS.lock().await;
+    let fs_locked = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return None,
+    };
+
+    let path = to_lfs_path("/timezone.conf");
+    let mut buf = [0u8; 16];
+    let mut len = 0;
+
+    let res = fs_locked.0.open_file_with_options_and_then(
+        |o| o.read(true),
+        &path,
+        |file| {
+            len = file.read(&mut buf)?;
+            Ok(())
+        },
+    );
+
+    if res.is_err() || len == 0 {
+        return None;
+    }
+
+    if let Ok(offset_str) = core::str::from_utf8(&buf[..len]) {
+        if let Ok(offset_minutes) = offset_str.trim().parse::<i32>() {
+            return Some(TzConfig { offset_minutes });
+        }
+    }
+    None
 }

@@ -9,6 +9,7 @@ mod dhcp;
 mod http_server;
 mod log_filter;
 mod logger;
+mod ntp;
 
 use cyw43_pio::PioSpi;
 use defmt::unwrap;
@@ -38,11 +39,13 @@ bind_interrupts!(struct Irqs {
                  embassy_rp::dma::InterruptHandler<DMA_CH1>,
                  embassy_rp::dma::InterruptHandler<DMA_CH2>,
                  embassy_rp::dma::InterruptHandler<embassy_rp::peripherals::DMA_CH3>;
+    POWMAN_IRQ_TIMER => embassy_rp::aon_timer::InterruptHandler;
 });
 
 /// Background task to blink the CYW43 LED
 #[embassy_executor::task]
 async fn blink_task(mut control: cyw43::Control<'static>) {
+    defmt::info!("blink_task started");
     loop {
         control.gpio_set(0, true).await;
 
@@ -184,6 +187,7 @@ async fn uart_task(
     uid_str: &'static str,
     stack: Stack<'static>,
 ) {
+    defmt::info!("uart_task started");
     let (mut tx, mut rx) = uart.split();
     let mut buf = [0u8; 64];
     let mut idx = 0;
@@ -533,14 +537,16 @@ async fn main(spawner: Spawner) {
 
     // Initialize Flash for logger
     let _ = uart.blocking_write(b"-> Initializing Logger...\r\n");
-    let flash = embassy_rp::flash::Flash::new(p.FLASH, p.DMA_CH2, Irqs);
-
-    if let Err(_e) = logger::init(flash) {
-        defmt::error!("Logger init failed!");
+    // Initialize FileSystem and RTC
+    if let Err(e) = logger::init(
+        embassy_rp::flash::Flash::new(p.FLASH, p.DMA_CH3, Irqs),
+        p.POWMAN,
+        Irqs,
+    ) {
+        defmt::error!("Failed to initialize logger: {:?}", defmt::Debug2Format(&e));
     } else {
         defmt::info!("Logger initialized successfully.");
-        // Test log
-        let _ = embassy_futures::block_on(logger::log_write_all(b"System booted."));
+        let _ = logger::write_log("=== System Boot ===").await;
     }
 
     let spi = PioSpi::new(
@@ -598,6 +604,7 @@ async fn main(spawner: Spawner) {
         spawner.spawn(unwrap!(http_server::http_server_task(*stack, true)));
         spawner.spawn(unwrap!(net_config_task(*stack)));
         spawner.spawn(unwrap!(mdns_task(*stack, short_uid.as_str())));
+        spawner.spawn(unwrap!(ntp::ntp_sync_task(*stack)));
 
         let _ = uart.blocking_write(b"-> Joining Wi-Fi AP...\r\n");
 
@@ -617,6 +624,7 @@ async fn main(spawner: Spawner) {
             cortex_m::peripheral::SCB::sys_reset();
         } else {
             let _ = uart.blocking_write(b"-> WiFi Connected.\r\n");
+            let _ = logger::write_log("WiFi Connected (Station Mode)").await;
         }
         stack
     } else {
