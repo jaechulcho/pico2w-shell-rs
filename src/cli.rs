@@ -1,12 +1,22 @@
 use core::sync::atomic::{AtomicBool, Ordering};
+use embassy_net::Stack;
 use embassy_rp::gpio::Output;
 use embassy_rp::uart::{Blocking, UartTx};
-//use embedded_io_async::Write;
+use embedded_hal_nb::serial::Write;
+use heapless::Vec;
 
 // 모든 커맨트 인스턴스를 모아둔 배열
 pub enum CliOutput<'a> {
     Uart(&'a mut UartTx<'static, Blocking>),
     Buffer(&'a mut heapless::String<2048>),
+    Tcp(
+        &'a mut embassy_sync::channel::Sender<
+            'static,
+            embassy_sync::blocking_mutex::raw::ThreadModeRawMutex,
+            Vec<u8, 64>,
+            16,
+        >,
+    ),
 }
 
 pub enum CommandEnum {
@@ -21,6 +31,8 @@ pub enum CommandEnum {
     Cd(CdCommand),
     Ls(LsCommand),
     Cat(CatCommand),
+    WifiReset(WifiResetCommand),
+    SysScan(SysScanCommand),
 }
 
 impl CommandEnum {
@@ -38,6 +50,8 @@ impl CommandEnum {
             Self::Cd(c) => c.name(),
             Self::Ls(c) => c.name(),
             Self::Cat(c) => c.name(),
+            Self::WifiReset(c) => c.name(),
+            Self::SysScan(c) => c.name(),
         }
     }
 
@@ -54,6 +68,8 @@ impl CommandEnum {
             Self::Cd(c) => c.description(),
             Self::Ls(c) => c.description(),
             Self::Cat(c) => c.description(),
+            Self::WifiReset(c) => c.description(),
+            Self::SysScan(c) => c.description(),
         }
     }
 
@@ -63,19 +79,22 @@ impl CommandEnum {
         led: &mut Output<'static>,
         args: &[&str],
         uid_str: &str,
+        stack: Stack<'static>,
     ) {
         match self {
-            Self::Help(c) => c.exec(out, led, args, uid_str).await,
-            Self::Led(c) => c.exec(out, led, args, uid_str).await,
-            Self::Info(c) => c.exec(out, led, args, uid_str).await,
-            Self::Echo(c) => c.exec(out, led, args, uid_str).await,
-            Self::Log(c) => c.exec(out, led, args, uid_str).await,
-            Self::Auth(c) => c.exec(out, led, args, uid_str).await,
-            Self::Reboot(c) => c.exec(out, led, args, uid_str).await,
-            Self::Mkdir(c) => c.exec(out, led, args, uid_str).await,
-            Self::Cd(c) => c.exec(out, led, args, uid_str).await,
-            Self::Ls(c) => c.exec(out, led, args, uid_str).await,
-            Self::Cat(c) => c.exec(out, led, args, uid_str).await,
+            Self::Help(c) => c.exec(out, led, args, uid_str, stack).await,
+            Self::Led(c) => c.exec(out, led, args, uid_str, stack).await,
+            Self::Info(c) => c.exec(out, led, args, uid_str, stack).await,
+            Self::Echo(c) => c.exec(out, led, args, uid_str, stack).await,
+            Self::Log(c) => c.exec(out, led, args, uid_str, stack).await,
+            Self::Auth(c) => c.exec(out, led, args, uid_str, stack).await,
+            Self::Reboot(c) => c.exec(out, led, args, uid_str, stack).await,
+            Self::Mkdir(c) => c.exec(out, led, args, uid_str, stack).await,
+            Self::Cd(c) => c.exec(out, led, args, uid_str, stack).await,
+            Self::Ls(c) => c.exec(out, led, args, uid_str, stack).await,
+            Self::Cat(c) => c.exec(out, led, args, uid_str, stack).await,
+            Self::WifiReset(c) => c.exec(out, led, args, uid_str, stack).await,
+            Self::SysScan(c) => c.exec(out, led, args, uid_str, stack).await,
         }
     }
 }
@@ -92,27 +111,33 @@ const COMMANDS: &[CommandEnum] = &[
     CommandEnum::Cd(CdCommand),
     CommandEnum::Ls(LsCommand),
     CommandEnum::Cat(CatCommand),
+    CommandEnum::WifiReset(WifiResetCommand),
+    CommandEnum::SysScan(SysScanCommand),
 ];
 
 static TCP_AUTHENTICATED: AtomicBool = AtomicBool::new(false);
 
-pub async fn uart_write_all(out: &mut CliOutput<'_>, buf: &[u8]) {
+pub async fn uart_write_all(out: &mut CliOutput<'_>, buf: &[u8], _stack: Stack<'static>) {
     if buf.is_empty() {
         return;
     }
     match out {
         CliOutput::Uart(uart) => {
-            let _ = uart.blocking_write(buf);
-            for chunk in buf.chunks(64) {
-                let mut vec: heapless::Vec<u8, 64> = heapless::Vec::new();
-                if vec.extend_from_slice(chunk).is_ok() {
-                    let _ = crate::TCP_TX_CHANNEL.try_send(vec);
-                }
+            for &b in buf {
+                while let Err(nb::Error::WouldBlock) = uart.write(b) {}
             }
         }
         CliOutput::Buffer(s) => {
             if let Ok(str_buf) = core::str::from_utf8(buf) {
                 let _ = s.push_str(str_buf);
+            }
+        }
+        CliOutput::Tcp(tx_ch) => {
+            for chunk in buf.chunks(64) {
+                let mut vec: heapless::Vec<u8, 64> = heapless::Vec::new();
+                if vec.extend_from_slice(chunk).is_ok() {
+                    let _ = tx_ch.send(vec).await;
+                }
             }
         }
     }
@@ -127,6 +152,7 @@ pub trait Command {
         led: &mut Output<'static>,
         args: &[&str],
         uid_str: &str,
+        stack: Stack<'static>,
     );
 }
 
@@ -144,23 +170,24 @@ impl Command for HelpCommand {
         _led: &mut Output<'static>,
         _args: &[&str],
         _uid_str: &str,
+        stack: Stack<'static>,
     ) {
-        uart_write_all(out, b"Available commands:\r\n").await;
+        uart_write_all(out, b"Available commands:\r\n", stack).await;
 
         for cmd in COMMANDS {
             // 각 커맨트의 name()과 description()을 재사용
-            uart_write_all(out, b"  ").await;
-            uart_write_all(out, cmd.name().as_bytes()).await;
+            uart_write_all(out, b"  ", stack).await;
+            uart_write_all(out, cmd.name().as_bytes(), stack).await;
 
             // 간격을 맞추기 위한 공백 처리 (예, 12칸 정렬)
             let padding = 12usize.saturating_sub(cmd.name().len());
             for _ in 0..padding {
-                uart_write_all(out, b" ").await;
+                uart_write_all(out, b" ", stack).await;
             }
 
-            uart_write_all(out, b" - ").await;
-            uart_write_all(out, cmd.description().as_bytes()).await;
-            uart_write_all(out, b"\r\n").await;
+            uart_write_all(out, b" - ", stack).await;
+            uart_write_all(out, cmd.description().as_bytes(), stack).await;
+            uart_write_all(out, b"\r\n", stack).await;
         }
     }
 }
@@ -179,23 +206,24 @@ impl Command for LedCommand {
         led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
+        stack: Stack<'static>,
     ) {
         if args.is_empty() {
-            uart_write_all(out, b"Usage: led <on|off>\r\n").await;
+            uart_write_all(out, b"Usage: led <on|off>\r\n", stack).await;
             return;
         }
 
         match args[0] {
             "on" => {
                 led.set_high();
-                uart_write_all(out, b"LED is ON\r\n").await;
+                uart_write_all(out, b"LED is ON\r\n", stack).await;
             }
             "off" => {
                 led.set_low();
-                uart_write_all(out, b"LED is OFF\r\n").await;
+                uart_write_all(out, b"LED is OFF\r\n", stack).await;
             }
             _ => {
-                uart_write_all(out, b"Unknown LED state. Use 'on' or 'off'.\r\n").await;
+                uart_write_all(out, b"Unknown LED state. Use 'on' or 'off'.\r\n", stack).await;
             }
         }
     }
@@ -215,13 +243,39 @@ impl Command for InfoCommand {
         _led: &mut Output<'static>,
         _args: &[&str],
         uid_str: &str,
+        stack: Stack<'static>,
     ) {
-        uart_write_all(out, b"System: Raspberry Pi Pico 2 W\r\n").await;
-        uart_write_all(out, b"CPU: RP2350 (RISC-V/ARM)\r\n").await;
-        uart_write_all(out, b"WiFi/BLE: CYW43439\r\n").await;
-        uart_write_all(out, b"UID: ").await;
-        uart_write_all(out, uid_str.as_bytes()).await;
-        uart_write_all(out, b"\r\n").await;
+        uart_write_all(out, b"System: Raspberry Pi Pico 2 W\r\n", stack).await;
+        uart_write_all(out, b"CPU: RP2350 (RISC-V/ARM)\r\n", stack).await;
+        uart_write_all(out, b"WiFi/BLE: CYW43439\r\n", stack).await;
+        uart_write_all(out, b"UID: ", stack).await;
+        uart_write_all(out, uid_str.as_bytes(), stack).await;
+        uart_write_all(out, b"\r\n", stack).await;
+
+        if let Some(config) = crate::logger::read_wifi_conf().await {
+            uart_write_all(out, b"Mode: Station (Connected to ", stack).await;
+            uart_write_all(out, config.ssid.as_bytes(), stack).await;
+            uart_write_all(out, b")\r\n", stack).await;
+        } else {
+            uart_write_all(out, b"Mode: Setup SoftAP (AP Mode)\r\n", stack).await;
+        }
+
+        if let Some(config) = stack.config_v4() {
+            let addr = config.address.address();
+            let mut ip_str = heapless::String::<32>::new();
+            let octets = addr.octets();
+            let _ = core::fmt::write(
+                &mut ip_str,
+                format_args!(
+                    "IP: {}.{}.{}.{}\r\n",
+                    octets[0], octets[1], octets[2], octets[3]
+                ),
+            );
+            uart_write_all(out, ip_str.as_bytes(), stack).await;
+        } else {
+            uart_write_all(out, b"IP: Not acquired\r\n", stack).await;
+        }
+        uart_write_all(out, b"Hostname: pico.local\r\n", stack).await;
     }
 }
 
@@ -239,14 +293,15 @@ impl Command for EchoCommand {
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
+        stack: Stack<'static>,
     ) {
         for (i, arg) in args.iter().enumerate() {
-            uart_write_all(out, arg.as_bytes()).await;
+            uart_write_all(out, arg.as_bytes(), stack).await;
             if i < args.len() - 1 {
-                uart_write_all(out, b" ").await;
+                uart_write_all(out, b" ", stack).await;
             }
         }
-        uart_write_all(out, b"\r\n").await;
+        uart_write_all(out, b"\r\n", stack).await;
     }
 }
 
@@ -264,6 +319,7 @@ impl Command for LogCommand {
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
+        stack: Stack<'static>,
     ) {
         use crate::log_filter::LOG_LEVEL;
         use core::sync::atomic::Ordering;
@@ -278,20 +334,20 @@ impl Command for LogCommand {
                 4 => "trace",
                 _ => "unknown",
             };
-            let _ = uart_write_all(out, b"Current log level: ").await;
-            let _ = uart_write_all(out, level_str.as_bytes()).await;
-            let _ = uart_write_all(out, b"\r\n").await;
+            let _ = uart_write_all(out, b"Current log level: ", stack).await;
+            let _ = uart_write_all(out, level_str.as_bytes(), stack).await;
+            let _ = uart_write_all(out, b"\r\n", stack).await;
             return;
         }
 
         let new_level = match args[0] {
             "print" => {
-                let _ = crate::logger::log_print(out).await;
+                let _ = crate::logger::log_print(out, stack).await;
                 return;
             }
             "clear" => {
                 let _ = crate::logger::log_clear().await;
-                let _ = uart_write_all(out, b"Log cleared.\r\n").await;
+                let _ = uart_write_all(out, b"Log cleared.\r\n", stack).await;
                 return;
             }
             "record" => {
@@ -304,9 +360,9 @@ impl Command for LogCommand {
                         let _ = msg.push_str(arg);
                     }
                     let _ = crate::logger::write_log(msg.as_str()).await;
-                    let _ = uart_write_all(out, b"Log recorded.\r\n").await;
+                    let _ = uart_write_all(out, b"Log recorded.\r\n", stack).await;
                 } else {
-                    let _ = uart_write_all(out, b"Usage: log record <message>\r\n").await;
+                    let _ = uart_write_all(out, b"Usage: log record <message>\r\n", stack).await;
                 }
                 return;
             }
@@ -319,6 +375,7 @@ impl Command for LogCommand {
                 let _ = uart_write_all(
                     out,
                     b"Invalid use. Subcommands: print, clear, record. Levels: error, warn, info, debug, trace\r\n",
+                    stack,
                 )
                 .await;
                 return;
@@ -326,9 +383,9 @@ impl Command for LogCommand {
         };
 
         LOG_LEVEL.store(new_level, Ordering::Relaxed);
-        let _ = uart_write_all(out, b"Log level set to ").await;
-        let _ = uart_write_all(out, args[0].as_bytes()).await;
-        let _ = uart_write_all(out, b"\r\n").await;
+        let _ = uart_write_all(out, b"Log level set to ", stack).await;
+        let _ = uart_write_all(out, args[0].as_bytes(), stack).await;
+        let _ = uart_write_all(out, b"\r\n", stack).await;
     }
 }
 
@@ -346,8 +403,9 @@ impl Command for RebootCommand {
         _led: &mut Output<'static>,
         _args: &[&str],
         _uid_str: &str,
+        stack: Stack<'static>,
     ) {
-        uart_write_all(out, b"Rebooting to bootloader...\r\n").await;
+        uart_write_all(out, b"Rebooting to bootloader...\r\n", stack).await;
         // Wait a bit for the message to be sent
         embassy_time::Timer::after_millis(100).await;
         cortex_m::peripheral::SCB::sys_reset();
@@ -368,9 +426,10 @@ impl Command for AuthCommand {
         _led: &mut Output<'static>,
         args: &[&str],
         uid_str: &str,
+        stack: Stack<'static>,
     ) {
         if args.is_empty() {
-            uart_write_all(out, b"Usage: auth <passkey>\r\n").await;
+            uart_write_all(out, b"Usage: auth <passkey>\r\n", stack).await;
             return;
         }
 
@@ -383,9 +442,14 @@ impl Command for AuthCommand {
 
         if args[0] == passkey {
             TCP_AUTHENTICATED.store(true, Ordering::SeqCst);
-            uart_write_all(out, b"Authentication successful. Shell unlocked.\r\n").await;
+            uart_write_all(
+                out,
+                b"Authentication successful. Shell unlocked.\r\n",
+                stack,
+            )
+            .await;
         } else {
-            uart_write_all(out, b"Authentication failed. Incorrect passkey.\r\n").await;
+            uart_write_all(out, b"Authentication failed. Incorrect passkey.\r\n", stack).await;
         }
     }
 }
@@ -404,15 +468,16 @@ impl Command for MkdirCommand {
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
+        stack: Stack<'static>,
     ) {
         if args.is_empty() {
-            uart_write_all(out, b"Usage: mkdir <path>\r\n").await;
+            uart_write_all(out, b"Usage: mkdir <path>\r\n", stack).await;
             return;
         }
         if crate::logger::fs_mkdir(args[0]).await.is_err() {
-            uart_write_all(out, b"error: failed to create directory\r\n").await;
+            uart_write_all(out, b"error: failed to create directory\r\n", stack).await;
         } else {
-            uart_write_all(out, b"OK\r\n").await;
+            uart_write_all(out, b"OK\r\n", stack).await;
         }
     }
 }
@@ -431,13 +496,14 @@ impl Command for CdCommand {
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
+        stack: Stack<'static>,
     ) {
         if args.is_empty() {
-            uart_write_all(out, b"Usage: cd <path>\r\n").await;
+            uart_write_all(out, b"Usage: cd <path>\r\n", stack).await;
             return;
         }
         if crate::logger::fs_cd(args[0]).await.is_err() {
-            uart_write_all(out, b"error: no such file or directory\r\n").await;
+            uart_write_all(out, b"error: no such file or directory\r\n", stack).await;
         }
     }
 }
@@ -456,10 +522,11 @@ impl Command for LsCommand {
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
+        stack: Stack<'static>,
     ) {
         let path = if args.is_empty() { None } else { Some(args[0]) };
-        if crate::logger::fs_ls(out, path).await.is_err() {
-            uart_write_all(out, b"error: failed to list directory\r\n").await;
+        if crate::logger::fs_ls(out, path, stack).await.is_err() {
+            uart_write_all(out, b"error: failed to list directory\r\n", stack).await;
         }
     }
 }
@@ -478,12 +545,13 @@ impl Command for CatCommand {
         _led: &mut Output<'static>,
         args: &[&str],
         _uid_str: &str,
+        stack: Stack<'static>,
     ) {
         if args.is_empty() {
-            uart_write_all(out, b"Usage: cat <path>\r\n").await;
+            uart_write_all(out, b"Usage: cat <path>\r\n", stack).await;
             return;
         }
-        let _ = crate::logger::fs_cat(out, args[0]).await;
+        let _ = crate::logger::fs_cat(out, args[0], stack).await;
     }
 }
 
@@ -493,6 +561,7 @@ pub async fn handle_command(
     led: &mut Output<'static>,
     uid_str: &str,
     from_tcp: bool,
+    stack: Stack<'static>,
 ) {
     let mut parts = line.split_whitespace();
     let Some(cmd_name) = parts.next() else { return };
@@ -510,17 +579,83 @@ pub async fn handle_command(
                 && cmd_name != AuthCommand.name()
                 && cmd_name != RebootCommand.name()
             {
-                uart_write_all(out, b"Unauthored. Please run 'auth <passkey>' first.\r\n").await;
+                uart_write_all(
+                    out,
+                    b"Unauthored. Please run 'auth <passkey>' first.\r\n",
+                    stack,
+                )
+                .await;
                 return;
             }
             // 3. 실행
-            cmd.exec(out, led, args, uid_str).await;
+            cmd.exec(out, led, args, uid_str, stack).await;
         }
         None => {
             // 4. 알 수 없는 명령어 처리
-            uart_write_all(out, b"Unknown command: ").await;
-            uart_write_all(out, cmd_name.as_bytes()).await;
-            uart_write_all(out, b"\r\n").await;
+            uart_write_all(out, b"Unknown command: ", stack).await;
+            uart_write_all(out, cmd_name.as_bytes(), stack).await;
+            uart_write_all(out, b"\r\n", stack).await;
         }
+    }
+}
+
+pub struct WifiResetCommand;
+impl Command for WifiResetCommand {
+    fn name(&self) -> &str {
+        "wifi"
+    }
+    fn description(&self) -> &str {
+        "Manage WiFi settings (e.g. 'wifi reset')"
+    }
+    async fn exec(
+        &self,
+        out: &mut CliOutput<'_>,
+        _led: &mut Output<'static>,
+        args: &[&str],
+        _uid_str: &str,
+        stack: Stack<'static>,
+    ) {
+        if args.is_empty() || args[0] != "reset" {
+            uart_write_all(out, b"Usage: wifi reset\r\n", stack).await;
+            return;
+        }
+
+        uart_write_all(
+            out,
+            b"Deleting Wi-Fi configuration and rebooting to Setup Mode...\r\n",
+            stack,
+        )
+        .await;
+        let _ = crate::logger::delete_wifi_conf().await;
+        embassy_time::Timer::after(embassy_time::Duration::from_millis(500)).await;
+        cortex_m::peripheral::SCB::sys_reset();
+    }
+}
+
+pub struct SysScanCommand;
+impl Command for SysScanCommand {
+    fn name(&self) -> &str {
+        "sys_scan"
+    }
+    fn description(&self) -> &str {
+        "Internal system scan command"
+    }
+    async fn exec(
+        &self,
+        out: &mut CliOutput<'_>,
+        _led: &mut Output<'static>,
+        _args: &[&str],
+        _uid_str: &str,
+        stack: Stack<'static>,
+    ) {
+        // Drop stale results
+        while let Ok(_) = crate::WIFI_SCAN_RESP_CHANNEL.try_receive() {}
+
+        // Send scan trigger to main task
+        let _ = crate::WIFI_SCAN_REQ_CHANNEL.send(()).await;
+
+        // Wait for JSON result
+        let result = crate::WIFI_SCAN_RESP_CHANNEL.receive().await;
+        uart_write_all(out, result.as_bytes(), stack).await;
     }
 }

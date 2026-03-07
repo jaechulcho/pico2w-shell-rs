@@ -11,7 +11,7 @@ mod log_filter;
 mod logger;
 
 use cyw43_pio::PioSpi;
-use defmt::*;
+use defmt::unwrap;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
@@ -23,7 +23,8 @@ use embassy_time::{Duration, Timer};
 use static_cell::StaticCell;
 
 use embassy_net::tcp::TcpSocket;
-use embassy_net::{Stack, StackResources};
+use embassy_net::udp::{PacketMetadata, UdpSocket};
+use embassy_net::{HardwareAddress, Ipv4Address, Ipv4Cidr, Stack, StackResources, StaticConfigV4};
 use heapless::Vec;
 
 #[cfg(target_arch = "riscv32")]
@@ -44,16 +45,101 @@ bind_interrupts!(struct Irqs {
 async fn blink_task(mut control: cyw43::Control<'static>) {
     loop {
         control.gpio_set(0, true).await;
-        Timer::after(Duration::from_millis(500)).await;
+
+        // Wait 500ms, checking for scan requests
+        match embassy_time::with_timeout(
+            Duration::from_millis(500),
+            crate::WIFI_SCAN_REQ_CHANNEL.receive(),
+        )
+        .await
+        {
+            Ok(_) => {
+                defmt::info!("Starting Wi-Fi Scan...");
+                let mut scanner = control.scan(cyw43::ScanOptions::default()).await;
+                let mut json = heapless::String::<2048>::new();
+                let _ = json.push_str("[");
+                let mut first = true;
+
+                while let Some(bss) = scanner.next().await {
+                    let ssid = core::str::from_utf8(&bss.ssid[..bss.ssid_len as usize])
+                        .unwrap_or("Unknown");
+                    // Filter empty SSIDs
+                    if ssid.trim().is_empty() {
+                        continue;
+                    }
+
+                    if !first {
+                        let _ = json.push_str(",");
+                    }
+                    first = false;
+
+                    // JSON format: {"ssid":"...","rssi":...}
+                    let mut obj = heapless::String::<128>::new();
+                    let _ = core::fmt::write(
+                        &mut obj,
+                        format_args!("{{\"ssid\":\"{}\",\"rssi\":{}}}", ssid, bss.rssi),
+                    );
+                    if json.len() + obj.len() < json.capacity() - 2 {
+                        let _ = json.push_str(obj.as_str());
+                    }
+                }
+                let _ = json.push_str("]");
+                defmt::info!("Scan complete!");
+                let _ = crate::WIFI_SCAN_RESP_CHANNEL.send(json).await;
+            }
+            Err(_) => {} // Timeout
+        }
+
         control.gpio_set(0, false).await;
-        Timer::after(Duration::from_millis(500)).await;
+
+        // Wait another 500ms, checking for scan requests again
+        match embassy_time::with_timeout(
+            Duration::from_millis(500),
+            crate::WIFI_SCAN_REQ_CHANNEL.receive(),
+        )
+        .await
+        {
+            Ok(_) => {
+                defmt::info!("Starting Wi-Fi Scan...");
+                let mut scanner = control.scan(cyw43::ScanOptions::default()).await;
+                let mut json = heapless::String::<2048>::new();
+                let _ = json.push_str("[");
+                let mut first = true;
+
+                while let Some(bss) = scanner.next().await {
+                    let ssid = core::str::from_utf8(&bss.ssid[..bss.ssid_len as usize])
+                        .unwrap_or("Unknown");
+                    if ssid.trim().is_empty() {
+                        continue;
+                    }
+
+                    if !first {
+                        let _ = json.push_str(",");
+                    }
+                    first = false;
+
+                    let mut obj = heapless::String::<128>::new();
+                    let _ = core::fmt::write(
+                        &mut obj,
+                        format_args!("{{\"ssid\":\"{}\",\"rssi\":{}}}", ssid, bss.rssi),
+                    );
+                    if json.len() + obj.len() < json.capacity() - 2 {
+                        let _ = json.push_str(obj.as_str());
+                    }
+                }
+                let _ = json.push_str("]");
+                defmt::info!("Scan complete!");
+                let _ = crate::WIFI_SCAN_RESP_CHANNEL.send(json).await;
+            }
+            Err(_) => {} // Timeout
+        }
     }
 }
 
 pub static TCP_RX_CHANNEL: embassy_sync::channel::Channel<
     embassy_sync::blocking_mutex::raw::ThreadModeRawMutex,
     Vec<u8, 64>,
-    8,
+    16,
 > = embassy_sync::channel::Channel::new();
 
 pub static TCP_TX_CHANNEL: embassy_sync::channel::Channel<
@@ -78,9 +164,26 @@ pub static WEB_RESP_CHANNEL: embassy_sync::channel::Channel<
     2,
 > = embassy_sync::channel::Channel::new();
 
+pub static WIFI_SCAN_REQ_CHANNEL: embassy_sync::channel::Channel<
+    embassy_sync::blocking_mutex::raw::ThreadModeRawMutex,
+    (),
+    1,
+> = embassy_sync::channel::Channel::new();
+
+pub static WIFI_SCAN_RESP_CHANNEL: embassy_sync::channel::Channel<
+    embassy_sync::blocking_mutex::raw::ThreadModeRawMutex,
+    heapless::String<2048>,
+    1,
+> = embassy_sync::channel::Channel::new();
+
 /// Task to handle UART CLI
 #[embassy_executor::task]
-async fn uart_task(uart: Uart<'static, Blocking>, mut led: Output<'static>, uid_str: &'static str) {
+async fn uart_task(
+    uart: Uart<'static, Blocking>,
+    mut led: Output<'static>,
+    uid_str: &'static str,
+    stack: Stack<'static>,
+) {
     let (mut tx, mut rx) = uart.split();
     let mut buf = [0u8; 64];
     let mut idx = 0;
@@ -88,6 +191,7 @@ async fn uart_task(uart: Uart<'static, Blocking>, mut led: Output<'static>, uid_
     cli::uart_write_all(
         &mut cli::CliOutput::Uart(&mut tx),
         b"\r\nPico 2W Shell (Embassy with WiFi TCP)\r\nType 'help' for commands.\r\n> ",
+        stack,
     )
     .await;
 
@@ -102,7 +206,7 @@ async fn uart_task(uart: Uart<'static, Blocking>, mut led: Output<'static>, uid_
         if let Some(c) = uart_byte {
             // Process UART byte
             if c == b'\r' || c == b'\n' {
-                cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), b"\r\n").await;
+                cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), b"\r\n", stack).await;
                 if idx > 0 {
                     if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
                         cli::handle_command(
@@ -110,49 +214,59 @@ async fn uart_task(uart: Uart<'static, Blocking>, mut led: Output<'static>, uid_
                             &mut cli::CliOutput::Uart(&mut tx),
                             &mut led,
                             uid_str,
-                            false,
+                            true,
+                            stack,
                         )
                         .await;
                     }
                     idx = 0;
                 }
-                cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), b"> ").await;
+                cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), b"> ", stack).await;
             } else if c == 0x08 || c == 0x7F {
                 if idx > 0 {
                     idx -= 1;
-                    cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), b"\x08 \x08").await;
+                    cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), b"\x08 \x08", stack)
+                        .await;
                 }
             } else if idx < buf.len() {
-                cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), &[c]).await;
+                cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), &[c], stack).await;
                 buf[idx] = c;
                 idx += 1;
             }
         } else if let Ok(tcp_data) = TCP_RX_CHANNEL.try_receive() {
             // Process TCP Data
+            let mut tcp_out = TCP_TX_CHANNEL.sender();
             for &c in tcp_data.iter() {
                 if c == b'\r' || c == b'\n' {
-                    cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), b"\r\n").await;
+                    cli::uart_write_all(&mut cli::CliOutput::Tcp(&mut tcp_out), b"\r\n", stack)
+                        .await;
                     if idx > 0 {
                         if let Ok(line) = core::str::from_utf8(&buf[..idx]) {
                             cli::handle_command(
                                 line,
-                                &mut cli::CliOutput::Uart(&mut tx),
+                                &mut cli::CliOutput::Tcp(&mut tcp_out),
                                 &mut led,
                                 uid_str,
                                 true,
+                                stack,
                             )
                             .await;
                         }
                         idx = 0;
                     }
-                    cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), b"> ").await;
+                    cli::uart_write_all(&mut cli::CliOutput::Tcp(&mut tcp_out), b"> ", stack).await;
                 } else if c == 0x08 || c == 0x7F {
                     if idx > 0 {
                         idx -= 1;
-                        cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), b"\x08 \x08").await;
+                        cli::uart_write_all(
+                            &mut cli::CliOutput::Tcp(&mut tcp_out),
+                            b"\x08 \x08",
+                            stack,
+                        )
+                        .await;
                     }
                 } else if idx < buf.len() {
-                    cli::uart_write_all(&mut cli::CliOutput::Uart(&mut tx), &[c]).await;
+                    cli::uart_write_all(&mut cli::CliOutput::Tcp(&mut tcp_out), &[c], stack).await;
                     buf[idx] = c;
                     idx += 1;
                 }
@@ -166,6 +280,7 @@ async fn uart_task(uart: Uart<'static, Blocking>, mut led: Output<'static>, uid_
                 &mut led,
                 uid_str,
                 true,
+                stack,
             )
             .await;
             defmt::info!("Main Loop returning web response: {}", buf.as_str());
@@ -232,6 +347,119 @@ async fn tcp_server_task(stack: Stack<'static>) {
                         break;
                     }
                 }
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn net_config_task(stack: Stack<'static>) {
+    loop {
+        stack.wait_link_up().await;
+
+        match embassy_time::with_timeout(Duration::from_secs(10), stack.wait_config_up()).await {
+            Ok(_) => {
+                defmt::info!("Network configuration up: {:?}", stack.config_v4());
+            }
+            Err(_) => {
+                defmt::info!("DHCP timeout (10s), acquiring Link-Local address...");
+                let mac = stack.hardware_address();
+                let HardwareAddress::Ethernet(eth) = mac;
+                let b3 = (eth.0[4] % 254) + 1;
+                let b4 = eth.0[5];
+                let addr = Ipv4Address::new(169, 254, b3, b4);
+                defmt::info!("Assigned Link-Local IP: {}.{}.{}.{}", 169, 254, b3, b4);
+                stack.set_config_v4(embassy_net::ConfigV4::Static(StaticConfigV4 {
+                    address: Ipv4Cidr::new(addr, 16),
+                    gateway: None,
+                    dns_servers: Vec::new(),
+                }));
+            }
+        }
+
+        stack.wait_link_down().await;
+    }
+}
+
+#[embassy_executor::task]
+async fn mdns_task(stack: Stack<'static>) {
+    let mut rx_meta = [PacketMetadata::EMPTY; 1];
+    let mut rx_payload = [0u8; 512];
+    let mut tx_meta = [PacketMetadata::EMPTY; 1];
+    let mut tx_payload = [0u8; 512];
+
+    let mut socket = UdpSocket::new(
+        stack,
+        &mut rx_meta,
+        &mut rx_payload,
+        &mut tx_meta,
+        &mut tx_payload,
+    );
+
+    socket.bind(5353).unwrap();
+
+    loop {
+        if !stack.has_multicast_group(Ipv4Address::new(224, 0, 0, 251)) {
+            let _ = stack.join_multicast_group(Ipv4Address::new(224, 0, 0, 251));
+        }
+
+        let mut buf = [0u8; 512];
+        match socket.recv_from(&mut buf).await {
+            Ok((n, remote)) => {
+                let data = &buf[..n];
+                // Check for "pico" + "local" query (robust matching)
+                let found = data.windows(11).any(|w| {
+                    (w[0] == 4
+                        && (w[1] | 0x20) == b'p'
+                        && (w[2] | 0x20) == b'i'
+                        && (w[3] | 0x20) == b'c'
+                        && (w[4] | 0x20) == b'o')
+                        && (w[5] == 5
+                            && (w[6] | 0x20) == b'l'
+                            && (w[7] | 0x20) == b'o'
+                            && (w[8] | 0x20) == b'c'
+                            && (w[9] | 0x20) == b'a'
+                            && (w[10] | 0x20) == b'l')
+                });
+
+                if found {
+                    defmt::info!("mDNS query for pico.local received from {:?}", remote);
+                    if let Some(config) = stack.config_v4() {
+                        let ip = config.address.address();
+                        let ip_bytes = ip.octets();
+
+                        let mut resp = [0u8; 64];
+                        resp[0..4].copy_from_slice(&[0x00, 0x00, 0x84, 0x00]); // Answer + Authoritative
+                        resp[4..12]
+                            .copy_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+                        let name = b"\x04pico\x05local\x00";
+                        resp[12..12 + name.len()].copy_from_slice(name);
+                        let mut pos = 12 + name.len();
+                        resp[pos..pos + 4].copy_from_slice(&[0x00, 0x01, 0x00, 0x01]); // Type A, Class IN
+                        pos += 4;
+                        resp[pos..pos + 4].copy_from_slice(&[0x00, 0x00, 0x00, 0x78]); // TTL 120
+                        pos += 4;
+                        resp[pos..pos + 2].copy_from_slice(&[0x00, 0x04]); // Data length 4
+                        pos += 2;
+                        resp[pos..pos + 4].copy_from_slice(&ip_bytes);
+                        pos += 4;
+
+                        let _ = socket.send_to(&resp[..pos], remote).await;
+                        // Also send to multicast group
+                        let _ = socket
+                            .send_to(
+                                &resp[..pos],
+                                (
+                                    embassy_net::IpAddress::Ipv4(Ipv4Address::new(224, 0, 0, 251)),
+                                    5353,
+                                ),
+                            )
+                            .await;
+                    }
+                }
+            }
+            Err(e) => {
+                defmt::warn!("mDNS Recv Error: {:?}", e);
             }
         }
     }
@@ -321,61 +549,119 @@ async fn main(spawner: Spawner) {
 
     let _ = uart.blocking_write(b"-> Config Power Save...\r\n");
     control
-        .set_power_management(cyw43::PowerManagementMode::PowerSave)
+        .set_power_management(cyw43::PowerManagementMode::None)
         .await;
 
-    let passkey = if uid_str.len() >= 8 {
-        &uid_str[uid_str.len() - 8..]
-    } else {
-        uid_str.as_str()
-    };
-
-    let _ = uart.blocking_write(b"-> Configuring Network Stack...\r\n");
-    let config = embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
-        address: embassy_net::Ipv4Cidr::new(embassy_net::Ipv4Address::new(192, 168, 4, 1), 24),
-        gateway: Some(embassy_net::Ipv4Address::new(192, 168, 4, 1)),
-        dns_servers: heapless::Vec::new(),
-    });
-
-    // Generate MAC address to avoid clash or just give random MAC Seed.
-    static STACK: StaticCell<Stack> = StaticCell::new();
-    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
-    let (stack_inst, net_runner) = embassy_net::new(
-        net_device,
-        config,
-        RESOURCES.init(StackResources::<3>::new()),
-        uid_u64,
-    );
-    let stack = &*STACK.init(stack_inst);
-
-    spawner.spawn(unwrap!(net_task(net_runner)));
-    spawner.spawn(unwrap!(tcp_server_task(*stack)));
-    spawner.spawn(unwrap!(http_server::http_server_task(*stack)));
-    spawner.spawn(unwrap!(dhcp::dhcp_server_task(
-        *stack,
-        embassy_net::Ipv4Address::new(192, 168, 4, 1),
-    )));
-
-    // Start SoftAP on Wi-Fi channel 6
     let mut start_msg = heapless::String::<128>::new();
-    let _ = core::fmt::write(
-        &mut start_msg,
-        format_args!(
-            "-> Starting SoftAP (SSID: '{}', Passkey: '{}')...\r\n",
-            ble_name.as_str(),
-            passkey
-        ),
-    );
-    let _ = uart.blocking_write(start_msg.as_bytes());
-    let _ = control.start_ap_wpa2(ble_name.as_str(), passkey, 6).await;
+    let stack_ref = if let Some(config) = crate::logger::read_wifi_conf().await {
+        let _ = core::fmt::write(
+            &mut start_msg,
+            format_args!(
+                "-> Starting Station Mode (Connecting to: '{}')...\r\n",
+                config.ssid.as_str()
+            ),
+        );
+        let _ = uart.blocking_write(start_msg.as_bytes());
+
+        let config_net = embassy_net::Config::dhcpv4(Default::default());
+
+        static STACK: StaticCell<Stack> = StaticCell::new();
+        static RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
+        let (stack_inst, net_runner) = embassy_net::new(
+            net_device,
+            config_net,
+            RESOURCES.init(StackResources::<8>::new()),
+            uid_u64,
+        );
+        let stack = &*STACK.init(stack_inst);
+
+        spawner.spawn(unwrap!(net_task(net_runner)));
+        spawner.spawn(unwrap!(tcp_server_task(*stack)));
+        spawner.spawn(unwrap!(http_server::http_server_task(*stack, true)));
+        spawner.spawn(unwrap!(net_config_task(*stack)));
+        spawner.spawn(unwrap!(mdns_task(*stack)));
+
+        let _ = uart.blocking_write(b"-> Joining Wi-Fi AP...\r\n");
+
+        // Try to join AP
+        if control
+            .join(
+                config.ssid.as_str(),
+                cyw43::JoinOptions::new(config.pass.as_bytes()),
+            )
+            .await
+            .is_err()
+        {
+            let _ =
+                uart.blocking_write(b"-> Failed to connect. Deleting config and rebooting...\r\n");
+            let _ = crate::logger::delete_wifi_conf().await;
+            embassy_time::Timer::after(embassy_time::Duration::from_millis(1000)).await;
+            cortex_m::peripheral::SCB::sys_reset();
+        } else {
+            let _ = uart.blocking_write(b"-> WiFi Connected.\r\n");
+        }
+        stack
+    } else {
+        // Fallback to Setup SoftAP
+        let passkey = if uid_str.len() >= 8 {
+            &uid_str[uid_str.len() - 8..]
+        } else {
+            uid_str.as_str()
+        };
+
+        let _ = core::fmt::write(
+            &mut start_msg,
+            format_args!(
+                "-> Starting Setup Mode SoftAP (SSID: '{}', Passkey: '{}')...\r\n",
+                ble_name.as_str(),
+                passkey
+            ),
+        );
+        let _ = uart.blocking_write(start_msg.as_bytes());
+
+        let config_net = embassy_net::Config::ipv4_static(embassy_net::StaticConfigV4 {
+            address: embassy_net::Ipv4Cidr::new(embassy_net::Ipv4Address::new(192, 168, 4, 1), 24),
+            gateway: Some(embassy_net::Ipv4Address::new(192, 168, 4, 1)),
+            dns_servers: heapless::Vec::new(),
+        });
+
+        static STACK: StaticCell<Stack> = StaticCell::new();
+        static RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
+        let (stack_inst, net_runner) = embassy_net::new(
+            net_device,
+            config_net,
+            RESOURCES.init(StackResources::<8>::new()),
+            uid_u64,
+        );
+        let stack = &*STACK.init(stack_inst);
+
+        spawner.spawn(unwrap!(net_task(net_runner)));
+        spawner.spawn(unwrap!(tcp_server_task(*stack)));
+        spawner.spawn(unwrap!(http_server::http_server_task(*stack, false)));
+        spawner.spawn(unwrap!(dhcp::dhcp_server_task(
+            *stack,
+            embassy_net::Ipv4Address::new(192, 168, 4, 1),
+        )));
+        spawner.spawn(unwrap!(mdns_task(*stack)));
+
+        let _ = uart.blocking_write(b"-> Starting SoftAP...\r\n");
+        let _ = control.start_ap_wpa2(ble_name.as_str(), passkey, 6).await;
+        let _ = uart.blocking_write(b"-> SoftAP Started.\r\n");
+        stack
+    };
 
     // PIN 28 LED
     let _ = uart.blocking_write(b"-> Spawning Application Tasks...\r\n");
-    let led = Output::new(p.PIN_28, Level::Low);
+    let led_pin = Output::new(p.PIN_28, Level::Low);
 
     // Spawn tasks
     spawner.spawn(unwrap!(blink_task(control)));
-    spawner.spawn(unwrap!(uart_task(uart, led, uid_str.as_str())));
+    spawner.spawn(unwrap!(uart_task(
+        uart,
+        led_pin,
+        uid_str.as_str(),
+        *stack_ref
+    )));
 
     // log_info!("Tasks spawned");
     loop {

@@ -126,47 +126,6 @@ pub async fn write_log(msg: &str) -> Result<(), littlefs2::io::Error> {
     log_write_all(msg.as_bytes()).await
 }
 
-pub async fn log_print(out: &mut crate::cli::CliOutput<'_>) -> Result<(), littlefs2::io::Error> {
-    let mut fs_guard = FS.lock().await;
-    let fs_locked = match fs_guard.as_mut() {
-        Some(fs) => fs,
-        None => return Ok(()),
-    };
-
-    let paths = [
-        littlefs2::path!("syslog.0.txt"),
-        littlefs2::path!("syslog.txt"),
-    ];
-
-    for path in &paths {
-        if fs_locked.0.metadata(path).is_ok() {
-            let mut offset = 0;
-            let mut buf = [0u8; 128];
-            loop {
-                let mut bytes_read = 0;
-                let _ = fs_locked.0.open_file_with_options_and_then(
-                    |o| o.read(true),
-                    path,
-                    |file| {
-                        file.seek(littlefs2::io::SeekFrom::Start(offset as u32))?;
-                        bytes_read = file.read(&mut buf)?;
-                        Ok(())
-                    },
-                );
-
-                if bytes_read == 0 {
-                    break;
-                }
-
-                offset += bytes_read;
-                crate::cli::uart_write_all(out, &buf[..bytes_read]).await;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 pub async fn log_clear() -> Result<(), littlefs2::io::Error> {
     let mut fs_guard = FS.lock().await;
     let fs_locked = match fs_guard.as_mut() {
@@ -289,7 +248,11 @@ pub struct DirEntryInfo {
     pub size: usize,
 }
 
-pub async fn fs_ls(out: &mut crate::cli::CliOutput<'_>, path: Option<&str>) -> Result<(), ()> {
+pub async fn fs_ls(
+    out: &mut crate::cli::CliOutput<'_>,
+    path: Option<&str>,
+    stack: embassy_net::Stack<'static>,
+) -> Result<(), ()> {
     let cwd_str = pwd().await;
     let target_path = path.unwrap_or(cwd_str.as_str());
     let resolved = resolve_path_str(cwd_str.as_str(), target_path);
@@ -303,7 +266,7 @@ pub async fn fs_ls(out: &mut crate::cli::CliOutput<'_>, path: Option<&str>) -> R
 
     let mut buf = heapless::String::<128>::new();
     core::write!(&mut buf, "Directory of {}:\r\n", resolved.as_str()).ok();
-    crate::cli::uart_write_all(out, buf.as_bytes()).await;
+    crate::cli::uart_write_all(out, buf.as_bytes(), stack).await;
 
     let mut entries = heapless::Vec::<DirEntryInfo, 32>::new();
     let _ = fs_locked.0.read_dir_and_then(&lfs_path, |dir| {
@@ -340,12 +303,16 @@ pub async fn fs_ls(out: &mut crate::cli::CliOutput<'_>, path: Option<&str>) -> R
             )
             .ok();
         }
-        crate::cli::uart_write_all(out, line.as_bytes()).await;
+        crate::cli::uart_write_all(out, line.as_bytes(), stack).await;
     }
     Ok(())
 }
 
-pub async fn fs_cat(out: &mut crate::cli::CliOutput<'_>, path: &str) -> Result<(), ()> {
+pub async fn fs_cat(
+    out: &mut crate::cli::CliOutput<'_>,
+    path: &str,
+    stack: embassy_net::Stack<'static>,
+) -> Result<(), ()> {
     let cwd_str = pwd().await;
     let resolved = resolve_path_str(cwd_str.as_str(), path);
     let lfs_path = to_lfs_path(&resolved);
@@ -360,7 +327,7 @@ pub async fn fs_cat(out: &mut crate::cli::CliOutput<'_>, path: &str) -> Result<(
     if meta.is_dir() {
         let mut buf = heapless::String::<64>::new();
         core::write!(&mut buf, "error: {} is a directory\r\n", path).ok();
-        crate::cli::uart_write_all(out, buf.as_bytes()).await;
+        crate::cli::uart_write_all(out, buf.as_bytes(), stack).await;
         return Err(());
     }
 
@@ -381,7 +348,7 @@ pub async fn fs_cat(out: &mut crate::cli::CliOutput<'_>, path: &str) -> Result<(
         if res.is_err() {
             let mut buf_str = heapless::String::<64>::new();
             core::write!(&mut buf_str, "error: could not read file\r\n").ok();
-            crate::cli::uart_write_all(out, buf_str.as_bytes()).await;
+            crate::cli::uart_write_all(out, buf_str.as_bytes(), stack).await;
             return Err(());
         }
 
@@ -390,8 +357,123 @@ pub async fn fs_cat(out: &mut crate::cli::CliOutput<'_>, path: &str) -> Result<(
         }
 
         offset += bytes_read;
-        crate::cli::uart_write_all(out, &buf[..bytes_read]).await;
+        crate::cli::uart_write_all(out, &buf[..bytes_read], stack).await;
     }
-    crate::cli::uart_write_all(out, b"\r\n").await;
+    crate::cli::uart_write_all(out, b"\r\n", stack).await;
     Ok(())
+}
+
+pub struct WifiConfig {
+    pub ssid: heapless::String<64>,
+    pub pass: heapless::String<64>,
+}
+
+pub async fn write_wifi_conf(ssid: &str, pass: &str) -> Result<(), ()> {
+    let mut fs_guard = FS.lock().await;
+    let fs_locked = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return Err(()),
+    };
+
+    let path = to_lfs_path("/wifi.conf");
+    let mut data = heapless::String::<128>::new();
+    let _ = core::write!(&mut data, "{}\n{}", ssid, pass);
+
+    fs_locked
+        .0
+        .open_file_with_options_and_then(
+            |o| o.write(true).create(true).truncate(true),
+            &path,
+            |file| {
+                file.write(data.as_bytes())?;
+                Ok(())
+            },
+        )
+        .map_err(|_| ())?;
+
+    Ok(())
+}
+
+pub async fn log_print(
+    out: &mut crate::cli::CliOutput<'_>,
+    stack: embassy_net::Stack<'static>,
+) -> Result<(), ()> {
+    let mut fs_guard = FS.lock().await;
+    let fs_locked = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return Ok(()),
+    };
+
+    let path = to_lfs_path("/log.txt");
+    let mut buf = [0u8; 512];
+    let mut offset = 0;
+
+    loop {
+        let mut len = 0;
+        let res = fs_locked.0.open_file_with_options_and_then(
+            |o| o.read(true),
+            &path,
+            |file| {
+                file.seek(littlefs2::io::SeekFrom::Start(offset))?;
+                len = file.read(&mut buf)?;
+                Ok(())
+            },
+        );
+
+        if res.is_err() || len == 0 {
+            break;
+        }
+
+        crate::cli::uart_write_all(out, &buf[..len], stack).await;
+        offset += len as u32;
+    }
+    Ok(())
+}
+
+pub async fn read_wifi_conf() -> Option<WifiConfig> {
+    let mut fs_guard = FS.lock().await;
+    let fs_locked = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return None,
+    };
+
+    let path = to_lfs_path("/wifi.conf");
+    let mut buf = [0u8; 128];
+    let mut len = 0;
+
+    let res = fs_locked.0.open_file_with_options_and_then(
+        |o| o.read(true),
+        &path,
+        |file| {
+            len = file.read(&mut buf)?;
+            Ok(())
+        },
+    );
+
+    if res.is_err() || len == 0 {
+        return None;
+    }
+
+    if let Ok(content) = core::str::from_utf8(&buf[..len]) {
+        let parts: heapless::Vec<&str, 2> = content.split('\n').collect();
+        if parts.len() == 2 {
+            let mut ssid = heapless::String::<64>::new();
+            let mut pass = heapless::String::<64>::new();
+            let _ = ssid.push_str(parts[0].trim());
+            let _ = pass.push_str(parts[1].trim());
+            return Some(WifiConfig { ssid, pass });
+        }
+    }
+    None
+}
+
+pub async fn delete_wifi_conf() -> Result<(), ()> {
+    let mut fs_guard = FS.lock().await;
+    let fs_locked = match fs_guard.as_mut() {
+        Some(fs) => fs,
+        None => return Err(()),
+    };
+
+    let path = to_lfs_path("/wifi.conf");
+    fs_locked.0.remove(&path).map_err(|_| ())
 }

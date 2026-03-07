@@ -25,7 +25,7 @@ embassy-time = { git = "https://github.com/embassy-rs/embassy.git", features = [
 embassy-rp = { git = "https://github.com/embassy-rs/embassy.git", features = ["defmt", "rp235xa", "time-driver", "critical-section-impl", "binary-info"] }
 embassy-usb = { git = "https://github.com/embassy-rs/embassy.git" }
 embassy-sync = { git = "https://github.com/embassy-rs/embassy.git" }
-embassy-net = { git = "https://github.com/embassy-rs/embassy.git", features = ["defmt", "tcp", "udp", "dhcpv4"] }
+embassy-net = { git = "https://github.com/embassy-rs/embassy.git", features = ["defmt", "tcp", "udp", "dhcpv4", "multicast", "dns"] }
 cyw43 = { git = "https://github.com/embassy-rs/embassy.git", features = ["defmt", "firmware-logs"] }
 cyw43-pio = { git = "https://github.com/embassy-rs/embassy.git" }
 embedded-io-async = "0.7.0"
